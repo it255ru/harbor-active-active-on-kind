@@ -24,14 +24,35 @@ data:
     #!/bin/sh
     set -e
     . /scripts/common.sh
-    MASTER=$(find_master || true)
+    # First start ever (empty /data) vs a restart with data on the volume
+    FRESH=1; if [ -d /data/appendonlydir ] || [ -f /data/dump.rdb ]; then FRESH=0; fi
+    # Who is the master now? Ask the sentinels first, then the valkey servers themselves.
+    discover() {
+      m=$(find_master || true); if [ -n "$m" ]; then echo "$m"; return 0; fi
+      for i in 0 1 2; do
+        h="redis-$i.$DOMAIN"; [ "$h" = "$SELF" ] && continue
+        r=$(timeout 3 valkey-cli -h "$h" -p 6379 role 2>/dev/null | head -1 | tr -d '\r' || true)
+        if [ "$r" = master ]; then echo "$h"; return 0; fi
+      done
+      return 1
+    }
+    MASTER=$(discover || true)
+    if [ -z "$MASTER" ] && [ "$(hostname)" = redis-0 ] && [ "$FRESH" = 0 ]; then
+      # A restart with old data and nobody answering (yet). Do NOT declare ourselves master at once: after a node
+      # loss the peers have already promoted someone, and a stale master next to the new one splits the brain and
+      # loses acknowledged writes (found in H4.7). Wait for the peers; only a full cold restart falls through.
+      n=0; while [ $n -lt 45 ] && [ -z "$MASTER" ]; do sleep 2; MASTER=$(discover || true); n=$((n+1)); done
+    fi
     if [ -z "$MASTER" ] && [ "$(hostname)" != redis-0 ]; then MASTER="redis-0.$DOMAIN"; fi
+    # min-replicas-*: a master that has no replica (an isolated or stale one) refuses writes instead of silently
+    # accepting data that will be thrown away when it is demoted
     set -- --bind 0.0.0.0 --protected-mode no --dir /data --appendonly yes \
-      --requirepass "$REDIS_PASSWORD" --masterauth "$REDIS_PASSWORD" --replica-announce-ip "$SELF"
+      --requirepass "$REDIS_PASSWORD" --masterauth "$REDIS_PASSWORD" --replica-announce-ip "$SELF" \
+      --min-replicas-to-write 1 --min-replicas-max-lag 10
     if [ -n "$MASTER" ] && [ "$MASTER" != "$SELF" ]; then
       set -- "$@" --replicaof "$MASTER" 6379
     fi
-    echo "starting valkey as $([ -n "$MASTER" ] && [ "$MASTER" != "$SELF" ] && echo "replica of $MASTER" || echo master)"
+    echo "starting valkey as $([ -n "$MASTER" ] && [ "$MASTER" != "$SELF" ] && echo "replica of $MASTER" || echo master) (fresh=$FRESH)"
     exec valkey-server "$@"
   start-sentinel.sh: |
     #!/bin/sh

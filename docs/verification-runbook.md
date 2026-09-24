@@ -249,7 +249,7 @@ kubectl -n harbor-deps get pods -l app=harbor-lb -o wide --no-headers | awk '{pr
 
 Ожидается: 2 пода `1/1 Running` на разных нодах.
 
-**V7.2 Бэкенды: по одному живому на PG и на Redis (на каждом HAProxy)**
+**V7.2 Бэкенды: по одному живому на PG и на Redis (на каждом HAProxy)** (Redis-бэкенд `UP`, только если это master **с подключённой репликой**)
 
 ```bash
 for p in $(kubectl -n harbor-deps get pods -l app=harbor-lb -o name); do
@@ -598,6 +598,35 @@ curl -sk -u admin:Harbor12345 -X POST $API/projects -H 'Content-Type: applicatio
 docker pull core.harbor.domain/dockerhub-proxy/library/alpine:3.20
 ```
 
+### P4.7 Отказ по ролям схемы
+
+Разрушающая проверка: убивает ноду держателя роли (`docker kill`), держит её выключенной, возвращает (`docker start`) и проверяет, что стенд восстановился. Под нагрузкой (запросы через Infra LB, `docker pull`/`push`, писатели в PostgreSQL и Redis).
+
+```bash
+hack/tests/h47-role-failure.sh consul     # нода лидера Consul
+hack/tests/h47-role-failure.sh redis      # нода master Redis
+hack/tests/h47-role-failure.sh pg         # нода лидера Patroni (primary PostgreSQL)
+hack/tests/h47-role-failure.sh lb         # нода, анонсирующая адрес Infra LB (владелец ARP 172.20.0.100)
+# необязательно: HOLD=45 (сколько секунд держать ноду выключенной после переключения) WORKDIR=<каталог логов>
+```
+
+Роль `app` проверяется отдельно (P4.4); `s3` — одна нода без резервирования, отказ ведёт к недоступности хранилища и здесь не проверяется. Один прогон длится 4–6 минут; запускать по одному, дожидаясь спада нагрузки хоста (`loadavg` < 3) и здорового стенда.
+
+Скрипт сам определяет жертву, выводит хронологию (`node-down`, `node-notready`, `failover-done`, `node-up`, `node-ready`, `recovered`) и анализ: ошибки и окна недоступности по каждой нагрузке, потерянные подтверждённые записи, перезапуски подов. Если скрипт прерван, ноду нужно вернуть вручную: `docker start <нода>`, затем `kubectl get nodes`.
+
+Ожидается (результаты приёмки 2026-09-24):
+
+| Роль | Переключение | Ошибки клиентов | Потери подтверждённых записей |
+|------|--------------|-----------------|-------------------------------|
+| consul | новый лидер raft, Patroni не переключается | нет | 0 |
+| redis | Sentinel повышает реплику за ≈ 16 с, Redis недоступен ≈ 21 с | нет (зависания запросов Harbor до ≈ 21 с) | 0, ответы `INCR` не идут назад |
+| pg | Patroni повышает реплику, запись ≈ 33 с недоступна, старый primary возвращается репликой `streaming` | 5xx у запросов, которым нужна БД, окно ≈ 16 с; `docker pull` — нет | 0 в этом прогоне, репликация асинхронная (гарантии нет) |
+| lb | адрес Infra LB недоступен ≈ 36 с, затем ещё ≈ 8 с при возврате ноды | единичные ошибки через `curl` (14 из 306), `docker pull` — нет | 0 |
+
+Общие критерии: после возврата ноды роль здорова (Consul 3 сервера; Patroni лидер + реплика `streaming`; Redis 1 master + 2 replica и кворум Sentinel; ingress-nginx и HAProxy `2/2`), поды Harbor **не перезапускались** (в блоке `container restarts` только поды на убитой ноде: kindnet, kube-proxy, её собственные), `LOST acknowledged` = 0, `went BACKWARDS` = 0.
+
+Если `went BACKWARDS` > 0 или `LOST acknowledged` > 0 — потеряны подтверждённые записи (для Redis это расщепление мозга: см. «Диагностику»). Если перезапустились core или jobservice — проверить пробы liveness (см. «Диагностику»).
+
 ## Диагностика
 
 | Симптом | Куда смотреть |
@@ -622,6 +651,10 @@ docker pull core.harbor.domain/dockerhub-proxy/library/alpine:3.20
 | Proxy-cache: pull по тегу не работает при недоступном апстриме (`artifact …:tag not found`) | так устроен Harbor: кэшируется манифест платформы по digest, тег резолвит апстрим; тянуть по digest (`repo@sha256:…`), digest платформы виден в `GET /projects/<проект>/repositories/<репо>/artifacts` |
 | Proxy-cache: репозиторий в проекте пуст, хотя pull работает | кэш регистрируется асинхронно (до ~40 с), либо проект с тем же именем уже проксировал этот путь раньше (остатки в S3 после удаления через API); использовать проект с новым именем |
 | Создание endpoint Docker Hub: ошибка при `POST /registries` | Harbor пингует `hub.docker.com`; проверить доступ из пода core (`curl https://hub.docker.com`, `https://registry-1.docker.io/v2/` → 401); после снятия блокировки DNS перезапустить CoreDNS (`kubectl -n kube-system rollout restart deploy/coredns`) |
+| HAProxy: у Redis нет `UP` при живом master | проверка требует `role:master` **и** подключённую реплику (`connected_slaves` ≥ 1): свежеповышенный master несколько секунд без реплик недоступен; `kubectl -n harbor-deps exec redis-N -c valkey -- valkey-cli info replication`; если реплик нет — смотреть `master_link_status` у реплик и логи Sentinel |
+| Записи Redis подтверждаются, но значения `INCR` «идут назад» | два master одновременно (устаревший master вернулся после отказа ноды); должны предотвращать `start-valkey.sh` (ожидание peers), `min-replicas-to-write 1` и проверка HAProxy; смотреть `+convert-to-slave` в логах Sentinel и строку `starting valkey as ...` в логе Valkey |
+| Поды Harbor перезапускаются при переключении Redis (`Container core failed liveness probe`) | пробы core/jobservice зависают, пока Redis недоступен; в `harbor-ha.yaml` liveness этих подов терпит ≈ 60 с (`timeoutSeconds: 5`, `failureThreshold: 6`); проверить `kubectl get deploy harbor-core -o jsonpath='{.spec.template.spec.containers[0].livenessProbe}'` |
+| Адрес Infra LB (`172.20.0.100`) недоступен после потери lb-ноды | MetalLB L2 переносит анонс на другую ноду ≈ 30–40 с; проверить `ip neigh show 172.20.0.100` (MAC совпадает с живой lb-нодой?), `kubectl logs -l app.kubernetes.io/component=speaker` |
 | Сбросить один компонент | удалить его Secret **и** PVC (`data-<имя>-N`), затем `make <таргет>`; удалять только Secret нельзя: новый пароль не совпадёт с данными |
 | Всё сломалось | `make cluster-delete && make cluster && make infra-lb && make ha-deps` (около 11 минут) |
 

@@ -1,7 +1,7 @@
 # Harbor LB (backlog H2.4, D7): HAProxy x2 on the `lb` nodes in front of PostgreSQL and Redis.
 # Harbor connects to a single address: harbor-lb.harbor-deps:5432 (PG primary) and :6379 (Redis master).
 #   PG:    HTTP check GET /primary on Patroni REST (8008) -> 200 only on the leader
-#   Redis: tcp-check AUTH + INFO replication, expects role:master
+#   Redis: tcp-check AUTH + INFO replication, expects role:master with at least one connected replica
 # Image pinned by digest (backlog "Версии компонентов HA").
 apiVersion: v1
 kind: ConfigMap
@@ -55,7 +55,10 @@ data:
       tcp-check send "PING\r\n"
       tcp-check expect string +PONG
       tcp-check send "INFO replication\r\n"
-      tcp-check expect string role:master
+      # role:master AND at least one connected replica: a stale master that came back after a node loss has
+      # none, and must not receive traffic next to the newly promoted one (split brain, found in H4.7)
+      # (the INFO reply has "role:master\r\nconnected_slaves:N"; `.` does not match a newline in HAProxy's regex)
+      tcp-check expect rstring role:master[^a-z]{1,4}connected_slaves:[1-9]
       tcp-check send "QUIT\r\n"
       tcp-check expect string +OK
       default-server check inter 3s fall 3 rise 2 on-marked-down shutdown-sessions resolvers k8s init-addr none resolve-prefer ipv4
@@ -109,7 +112,7 @@ spec:
         app: harbor-lb
       annotations:
         # roll pods when the config changes
-        config-version: "2"
+        config-version: "4"
     spec:
       nodeSelector:
         harbor-ha/role: lb

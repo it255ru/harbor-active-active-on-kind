@@ -107,6 +107,16 @@ core:
       matchLabelKeys: [pod-template-hash]   # spread every revision on its own, so a rollout ends 1+1 again
       labelSelector:
         matchLabels: {app: harbor, component: core}
+  # core's /api/v2.0/ping hangs while Redis is unreachable (a Sentinel failover takes ~20-30 s). With the chart
+  # default (timeout 1 s, 2 failures) kubelet KILLED both core containers during a Redis failover and Harbor was
+  # down (503) until they were back (H4.7). Liveness now tolerates ~60 s; readiness stays fast so a core without
+  # Redis just leaves the load balancing instead of being restarted.
+  livenessProbe:
+    initialDelaySeconds: 0
+    periodSeconds: 10
+    timeoutSeconds: 5
+    failureThreshold: 6
+    successThreshold: 1
   existingSecret: harbor-ha-secrets       # key secret
   existingXsrfSecret: harbor-ha-secrets   # key CSRF_KEY
   secretName: harbor-ha-token             # TLS secret with the token signing key/cert (stable across upgrades)
@@ -129,6 +139,13 @@ jobservice:
       matchLabelKeys: [pod-template-hash]   # spread every revision on its own, so a rollout ends 1+1 again
       labelSelector:
         matchLabels: {app: harbor, component: jobservice}
+  # same reason as core: the job queue lives in Redis and /api/v1/stats hangs during a Redis failover
+  livenessProbe:
+    initialDelaySeconds: 300
+    periodSeconds: 10
+    timeoutSeconds: 5
+    failureThreshold: 6
+    successThreshold: 1
   jobLoggers:
     - database          # `file` would need one ReadWriteMany volume shared by all replicas
   existingSecret: harbor-ha-secrets       # key JOBSERVICE_SECRET

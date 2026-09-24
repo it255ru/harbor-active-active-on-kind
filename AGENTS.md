@@ -17,7 +17,7 @@ Work follows **`backlog.md`** (HA Phases 0→5). No design decisions are open (s
 | `docs/stand-topology.md` | Stand map: nodes and roles, addresses and ports, data locations, secrets (Russian) |
 | `docs/verification-runbook.md` | Stand verification runbook (V1..V10 checks with expected results); to be ported to Ansible (H5.4) |
 | `hack/install-harbor-ha.sh` | Harbor HA install (`make harbor-ha`): Secrets in `default`, then pinned Helm chart with `hack/config/harbor-ha.yaml` |
-| `hack/tests/` | Failure-test scripts for Phase 4 (`h42-kill-during-push.sh`, `h43-rolling-update.sh` + `h43_analyze.py`, `h44-node-loss.sh` + `h44_analyze.py`, `h45-app-rollout.sh`, `h46-proxy-cache.sh`, `h41-push-pull.sh`) |
+| `hack/tests/` | Failure-test scripts for Phase 4 (`h42-kill-during-push.sh`, `h43-rolling-update.sh` + `h43_analyze.py`, `h44-node-loss.sh` + `h44_analyze.py`, `h45-app-rollout.sh`, `h46-proxy-cache.sh`, `h41-push-pull.sh`, `h47-role-failure.sh` + `h47_analyze.py`) |
 | `hack/helm-postrender.py` | Helm post-renderer for Harbor: adds `preStop` sleep to core/registry/portal (needs PyYAML) |
 | `hack/ha/` | HA dependency manifests: `consul.yaml`, `postgres.yaml` + `patroni/` (image build), `redis.yaml`, `haproxy.yaml`, `s3.yaml` + `s3-init.sh` |
 | `hack/deploy-app.sh` | Build/push demo image, trust Harbor's CA on the node, deploy the app (`make deploy-app`, run after `install`) |
