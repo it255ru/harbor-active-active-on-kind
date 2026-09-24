@@ -7,6 +7,14 @@ metadata:
   annotations:
     "helm.sh/hook": test
 spec:
+  {{- with .Values.nodeSelector }}
+  nodeSelector:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+  {{- with .Values.tolerations }}
+  tolerations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
   containers:
     - name: wget
       image: busybox

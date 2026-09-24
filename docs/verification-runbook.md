@@ -318,6 +318,82 @@ sysctl fs.inotify.max_user_instances fs.inotify.max_user_watches                
 
 Ориентиры (2026-09-24, без Harbor): около 3,9 ГиБ на 14 нод; control-plane около 740 МиБ, `lb`-ноды 500–540, `pg` 290–310, `s3` около 360, остальные 120–180. Со всем стендом оценка 12–13 ГиБ.
 
+## 11. Harbor (после `make harbor-ha` и `make deploy-app`)
+
+**V11.1 Реплики и размещение**
+
+```bash
+kubectl get pods -o custom-columns=C:.metadata.labels.component,NODE:.spec.nodeName --no-headers | grep -E '^(core|portal|registry|jobservice)' | sort | uniq -c
+kubectl get pods --no-headers | grep -E 'harbor-(database|redis)' | wc -l      # внутренних БД и Redis нет: ожидается 0
+```
+
+Ожидается: 8 строк с `1` (по одному поду каждого компонента на `harbor-worker` и `harbor-worker2`, то есть на обеих `app`-нодах); значение `2` в строке означает, что обе реплики на одной ноде (проверять после каждого rollout); `0` внутренних баз. Размещение по ролям проверяет V2.4. У jobservice 2-3 рестарта после первого запуска — штатная гонка со стартом core.
+
+**V11.2 UI, API и токены**
+
+```bash
+curl -sk -o /dev/null -w '%{http_code}\n' https://core.harbor.domain/                  # Ожидается: 200
+curl -sk -o /dev/null -w '%{http_code}\n' https://core.harbor.domain/v2/               # Ожидается: 401 (registry жив, нужен токен)
+echo Harbor12345 | docker login core.harbor.domain -u admin --password-stdin           # Ожидается: Login Succeeded
+```
+
+Если `docker login` даёт 500 и в логах core `unable to get PrivateKey from PEM type: PRIVATE KEY` — ключ токена в формате PKCS#8; см. «Диагностика».
+
+**V11.3 Push/pull образа и OCI-чарта**
+
+```bash
+make deploy-app                                                                          # проект, build/push, деплой; в конце Demo app ready
+curl -s http://172.20.0.101:5000/                                                        # Hello, Kube! (from <pod>)
+```
+
+Чарт: `helm registry login` → `helm package helm-hello-kube` → `helm push ... oci://core.harbor.domain/python/hello --ca-file ca.crt` → `helm pull`/`helm install` из OCI → `helm test hello-kube` (Phase: Succeeded), команды — в README.
+
+**V11.4 Блобы лежат в MinIO, а не в томе**
+
+```bash
+kubectl get pvc --no-headers | awk '{print $1}'                                          # Ожидается: только data-harbor-trivy-0
+# объекты бакета: mc ls --recursive h/registry-blobs (см. V8.2 для запуска mc); после push должны быть docker/registry/v2/blobs/...
+```
+
+**V11.5 Данные Harbor во внешних сервисах**
+
+```bash
+PGPASS=$(kubectl -n harbor-deps get secret pg-credentials -o jsonpath='{.data.harbor}' | base64 -d)
+kubectl -n harbor-deps exec pg-0 -- psql "postgresql://harbor:$PGPASS@harbor-lb.harbor-deps:5432/registry" -Atc "select count(*) from project"     # Ожидается: >= 1
+kubectl -n harbor-deps exec redis-0 -c valkey -- sh -c 'valkey-cli -n 0 dbsize'          # Ожидается: > 0 на текущем master (номер пода может отличаться, см. V6.1)
+```
+
+**V11.6 Rolling update не блокируется**
+
+```bash
+kubectl rollout restart deploy/harbor-core && kubectl rollout status deploy/harbor-core --timeout=180s     # Ожидается: successfully rolled out
+```
+
+Если обновление зависает с `Pending`-подом и `didn't satisfy existing pods anti-affinity rules` — в спеке остался обязательный `podAntiAffinity` (см. «Диагностика»).
+
+## 12. Распределение нагрузки (критерий 5 вехи 1)
+
+Проверяет, что запросы через Infra LB обслуживаются обеими репликами. Приложения Harbor не пишут access-логи, поэтому считаем по логам ingress-nginx: в записи есть адрес пода-получателя (`upstream`).
+
+```bash
+T0=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+for i in $(seq 1 100); do curl -sk -o /dev/null https://core.harbor.domain/api/v2.0/systeminfo; done   # core
+for i in $(seq 1 100); do curl -sk -o /dev/null https://core.harbor.domain/; done                       # portal
+for c in $(kubectl get pods -l app.kubernetes.io/name=ingress-nginx -o name); do kubectl logs $c --since-time=$T0; done > /tmp/ing.log
+```
+
+Затем разобрать `/tmp/ing.log`: для каждой строки взять имя backend-сервиса в квадратных скобках (`[default-harbor-core-80]` или `[default-harbor-portal-80]`) и IP пода сразу после него, сопоставить IP с подами (`kubectl get pods -o custom-columns=N:.metadata.name,IP:.status.podIP`) и посчитать запросы на каждый под.
+
+Ожидается: у `core` и у `portal` запросы разделены между двумя подами (в приёмке 2026-09-24: core 127/131, portal 50/50). Для registry: после серии `docker rmi` + `docker pull` (например, 20 раз) команда `kubectl logs <registry-pod> -c registry --since-time=$T0 | grep -c 'GET /v2/'` даёт ненулевое значение у обоих подов (в приёмке 20 и 18).
+
+HAProxy отправляет запросы БД на primary:
+
+```bash
+kubectl -n harbor-deps exec pg-0 -- sh -c "PGPASSWORD=\$PATRONI_SUPERUSER_PASSWORD psql -U postgres -h pg-0.pg-headless -Atc \"select count(*), count(distinct client_addr) from pg_stat_activity where usename='harbor'\""
+```
+
+Ожидается на primary: `N|2` (соединения `harbor` от двух адресов, то есть от обоих HAProxy); на реплике `0`. Если лидер сменился, поменять `pg-0` на текущего лидера (V4.2).
+
 ## Диагностика
 
 | Симптом | Куда смотреть |
@@ -330,13 +406,14 @@ sysctl fs.inotify.max_user_instances fs.inotify.max_user_watches                
 | Sentinel: `flags s_down`/`o_down` | `logs redis-N -c sentinel`; резолвинг `redis-N.redis-headless.harbor-deps.svc.cluster.local` |
 | MinIO `Access Denied` у Harbor | `minio-init` не завершился (V8.1); повторить `make minio` |
 | `172.20.0.100` не отвечает | `kubectl get endpoints ingress-nginx-controller` (нет Ready-подов — MetalLB не держит анонс), `kubectl logs -l app.kubernetes.io/component=speaker`, подсеть `kind` (V3.2) |
+| `docker login` → 500, в логах core `unable to get PrivateKey from PEM type: PRIVATE KEY` | Secret `harbor-ha-token` создан с ключом PKCS#8. Удалить его и выполнить `make harbor-ha` (скрипт создаёт PKCS#1), затем `kubectl rollout restart deploy/harbor-core` |
+| Rolling update завис, новый под `Pending`, `didn't satisfy existing pods anti-affinity rules` | обязательный `podAntiAffinity` на двух нодах блокирует surge-под; использовать `topologySpreadConstraints` (как в `harbor-ha.yaml`) или `maxSurge: 0` (как у `harbor-lb`); уже застрявшие Deployment'ы — `scale 0` → `2` |
 | Сбросить один компонент | удалить его Secret **и** PVC (`data-<имя>-N`), затем `make <таргет>`; удалять только Secret нельзя: новый пароль не совпадёт с данными |
 | Всё сломалось | `make cluster-delete && make cluster && make infra-lb && make ha-deps` (около 11 минут) |
 
 ## Что ранбук не проверяет
 
 - Отказы и переключения (Patroni failover, Sentinel failover, потеря одного HAProxy, потеря ноды): Phase 4 (H4.x) в `backlog.md`, засчитываются только после приёмки вехи 1 (H3.5).
-- Сам Harbor (Phase 3): после установки добавятся проверки UI, push/pull образа и OCI-чарта, работы обеих реплик core/portal/registry/jobservice и наличия блобов в бакете MinIO. Они опишутся в этом же документе.
 - Производительность и нагрузка.
 
 ## Перевод в Ansible (план)

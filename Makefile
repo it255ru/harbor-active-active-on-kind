@@ -60,6 +60,10 @@ $(KIND): $(LOCALBIN)
 infra-lb: ## Install the Infra LB only (MetalLB + ingress-nginx on the lb nodes).
 	@./hack/install-infra.sh
 
+.PHONY: harbor-ha
+harbor-ha: ## Install Harbor in HA mode (needs `make infra-lb ha-deps`). DRY_RUN=1 renders against the cluster only.
+	@DRY_RUN=$(DRY_RUN) ./hack/install-harbor-ha.sh
+
 .PHONY: install
 install: ## Install Harbor.
 	@./hack/install.sh

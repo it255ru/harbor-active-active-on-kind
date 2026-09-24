@@ -2,7 +2,7 @@
 
 Repo: **harbor-active-active-on-kind**. Goal: run **Harbor in active-active (HA) mode** on KinD — several replicas of core/portal/registry/jobservice (maybe trivy) behind ingress, sharing external PostgreSQL, Redis (Valkey) and S3-compatible object storage — and prove it survives losing a replica.
 
-**Provenance:** started 2026-09-24 as a copy of `harbor-on-kind` @ `b65df71` (full git history kept; not a GitHub fork, since GitHub forbids same-owner forks). Original single-node lab: https://github.com/it255ru/harbor-on-kind. Everything under "Baseline" below is verified-working *single-node* behavior inherited from there. **HA work status:** Phases 0–2 done (14-node cluster, Infra LB, Consul, Patroni/PostgreSQL, Valkey/Sentinel, HAProxy, MinIO); Phase 3 (Harbor in HA) is next — the plan and decisions are in `backlog.md` (written in Russian, source of truth).
+**Provenance:** started 2026-09-24 as a copy of `harbor-on-kind` @ `b65df71` (full git history kept; not a GitHub fork, since GitHub forbids same-owner forks). Original single-node lab: https://github.com/it255ru/harbor-on-kind. Everything under "Baseline" below is verified-working *single-node* behavior inherited from there. **HA work status:** Phases 0–3 done (14-node cluster, Infra LB, Consul, Patroni/PostgreSQL, Valkey/Sentinel, HAProxy, MinIO, Harbor in HA, deploy-app and OCI push/pull working); milestone 1 (H3.5) was accepted by the user on 2026-09-24; Phase 4 (milestone 2, failure tests) is next and now counts — the plan and decisions are in `backlog.md` (written in Russian, source of truth).
 
 See also: `AGENTS.md` (agent orientation), `README.md` (status, requirements and command list; Harbor HA sections get added as Phase 3 lands).
 
@@ -11,7 +11,7 @@ See also: `AGENTS.md` (agent orientation), `README.md` (status, requirements and
 Rules:
 - Work `backlog.md` phases in order; tick `- [ ]` → `- [x]` as items finish.
 - No design decisions are open (all settled 2026-09-24, see `backlog.md` "Решения и открытые вопросы"): D1 14 nodes (1 control-plane + app×2, lb×2, pg×2, redis×3, consul×3, s3×1), D2 Patroni + Consul, D3 Redis Sentinel (an *assumption* — prod mode unknown), D4 S3/MinIO, D5 one lab cluster at a time, D7 HAProxy as Harbor LB, D8 minimum scope, D9/D10 colors ignored and Nexus out of scope. Ask if a new decision appears — don't pick silently.
-- **Success is two-staged (D6):** first *milestone 1* — the whole stand works with correct distribution over the 14 nodes (roles, placement, healthy Consul/Patroni/Redis, end-to-end push/pull via the full chain, both app replicas serving); only after it passes do the Phase 4 failure tests (*milestone 2*) count. Don't report Phase 4 results as success before milestone 1 (`H3.5`) is accepted.
+- **Success is two-staged (D6):** first *milestone 1* — the whole stand works with correct distribution over the 14 nodes (roles, placement, healthy Consul/Patroni/Redis, end-to-end push/pull via the full chain, both app replicas serving); only after it passes do the Phase 4 failure tests (*milestone 2*) count. Milestone 1 (`H3.5`) is accepted (2026-09-24), so Phase 4 results now count.
 - **Target architecture** is described in `backlog.md` → "Целевая архитектура" (from the user's diagrams): Harbor app ×2 → Harbor LB ×2 (HAProxy) → PostgreSQL ×2 under Patroni with state in Consul ×3, + Redis ×3 (assumed Sentinel); blobs in S3 (Ceph in prod, MinIO stand-in here, own node); Infra LB (shared entry, ingress-nginx + MetalLB here) in front. Backups, Prometheus and Nexus appear on the diagram but are **out of scope** (D8, D10). Note `hb-lb` balances PG/Redis, it is **not** the Harbor ingress.
 - Don't invent versions. Every new component (PostgreSQL, Redis/Valkey, MinIO, any operator) gets an explicit pinned version recorded in `backlog.md` and the table below **before** it is installed.
 - Verify Harbor chart keys against `helm show values harbor/harbor --version 1.19.2`, not memory.
@@ -62,7 +62,8 @@ make postgres        # pg-image + hack/ha/postgres.yaml: PostgreSQL x2 under Pat
 make redis           # hack/ha/redis.yaml: Valkey x3 + Sentinel sidecars on the redis nodes, Secret redis-credentials generated on first run
 make harbor-lb       # hack/ha/haproxy.yaml: HAProxy x2 on the lb nodes; Service harbor-lb.harbor-deps :5432 (PG primary via Patroni /primary) and :6379 (Redis master)
 make minio           # hack/ha/minio.yaml: MinIO on the s3 node + bucket registry-blobs + scoped user for Harbor (Secret minio-credentials generated on first run)
-make install         # hack/install.sh: infra-lb, then Harbor (baseline values only — no HA tolerations yet, Harbor pods stay Pending on the tainted nodes until Phase 3)
+make harbor-ha       # hack/install-harbor-ha.sh: creates Secrets harbor-ha-secrets/-s3/-token in `default` once, then helm-installs Harbor 1.19.2 with hack/config/harbor-ha.yaml (DRY_RUN=1 = server-side dry run only; needs infra-lb + ha-deps)
+make install         # hack/install.sh: infra-lb, then harbor-ha (the old single-node values hack/config/harbor.yaml are no longer used)
 make deploy-app      # hack/deploy-app.sh: project `python` → docker login/build/push → node CA trust → pull secret → kubectl apply + rollout restart (run after `install`; idempotent)
 make cluster-ctx     # kubectl use-context kind-harbor
 make cluster-delete
@@ -81,6 +82,8 @@ Gotchas:
 - `sudo` is interactive-only in agent sessions: `make add-host` (when the entry is missing) and the host Docker `insecure-registries` change must be run by the user. `make deploy-app` fails fast with the exact commands if the latter is missing.
 - `make deploy-app` always redoes the node's CA trust + `systemctl restart containerd` (Harbor's self-signed CA regenerates on every install). Pods survive; ones already `Terminating` may take longer to disappear — transient, not a hang.
 - Use `systemctl reload docker`, not `restart`, after editing `daemon.json` while a cluster is running.
+- Harbor chart resolves `existingSecret` with `lookup` at render time: the Secrets must exist before `helm install`; `helm template` without a cluster shows empty passwords — validate with `DRY_RUN=1 make harbor-ha` instead.
+- 2-replica workloads on a 2-node role: use `topologySpreadConstraints` (maxSkew 1, plus `matchLabelKeys: [pod-template-hash]` so a rollout still ends 1+1), not a required `podAntiAffinity` — that deadlocks rolling updates (surge pod has no node, maxUnavailable rounds to 0). Harbor's token key must be PKCS#1 (`openssl genrsa -traditional`). The demo app runs on the control-plane node (only place where `deploy-app.sh` installs the CA).
 - HA stand: every worker is tainted `harbor-ha/role=<role>:NoSchedule`; any new workload needs a matching `nodeSelector` + toleration. Dependencies live in namespace `harbor-deps` (`hack/ha/`); passwords are generated on the first run into Secrets there — to reset a component delete its Secret **and** PVCs together.
 - `make pg-image` output (`harbor-ha/patroni:4.1.5-pg18.6`) is loaded with `kind load` into the `pg` nodes only and vanishes with the cluster.
 - Cold-start image pulls fail transiently (`ErrImagePull`); pods self-heal, don't rebuild the cluster.

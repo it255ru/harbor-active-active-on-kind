@@ -2,7 +2,7 @@
 
 Harbor in active-active mode on KinD: several replicas of core, portal, registry and jobservice behind ingress, sharing external PostgreSQL, Redis (Valkey) and S3-compatible object storage, with the goal of surviving the loss of a replica.
 
-**Status:** in progress. Phases 0-2 are done: the 14-node cluster, Infra LB, Consul, PostgreSQL under Patroni, Valkey with Sentinel, HAProxy (Harbor LB) and MinIO are up (`make cluster infra-lb ha-deps`). Harbor itself is not yet deployed in HA mode (Phase 3), so `make install` and `make deploy-app` do not work on this cluster yet. The plan, design decisions (D1-D10) and acceptance criteria are in [backlog.md](backlog.md) (written in Russian). The Harbor sections below describe the inherited single-node baseline from [harbor-on-kind](https://github.com/it255ru/harbor-on-kind).
+**Status:** in progress. Phases 0-3 are done: the 14-node cluster, Infra LB, Consul, PostgreSQL under Patroni, Valkey with Sentinel, HAProxy (Harbor LB), MinIO and Harbor itself (2 replicas each of core, portal, registry and jobservice) are up, and image and OCI chart push/pull work through the full chain (`make cluster infra-lb ha-deps harbor-ha deploy-app`). Milestone 1 (the whole stand working across the 14 nodes) was accepted on 2026-09-24; the failure tests (Phase 4, milestone 2) are next. The plan, design decisions (D1-D10) and acceptance criteria are in [backlog.md](backlog.md) (written in Russian).
 
 ## Target architecture
 
@@ -43,7 +43,7 @@ Baseline (installed by `make install`):
 | ingress-nginx chart | `4.15.1` (app `1.15.1`) |
 | Harbor chart / app | `1.19.2` / `2.15.2` |
 
-HA components (pinned in Phase 0, not installed yet; image digests are in `backlog.md`):
+HA components (installed by `make ha-deps`; image digests are in `backlog.md`):
 
 | Component | Version |
 |-----------|---------|
@@ -68,7 +68,15 @@ make cluster-delete
 
 Measured from scratch (2026-09-24): `cluster` + `infra-lb` about 7 min, `ha-deps` about 4 min, dominated by image pulls.
 
-Harbor itself is **not** deployed in HA mode yet (backlog Phase 3): `make install` and `make deploy-app` still target the single-node baseline values and will not work on this cluster, because every worker is tainted by role and `hack/config/harbor.yaml` has no tolerations. `make add-host` and the Docker `insecure-registries` step below are only needed once Harbor is up.
+Then install Harbor and the demo app:
+
+```bash
+make harbor-ha     # Harbor 1.19.2 in HA mode (hack/config/harbor-ha.yaml); DRY_RUN=1 renders against the cluster only
+make add-host      # adds "$LB_IP core.harbor.domain" to /etc/hosts (sudo, once)
+make deploy-app    # project, image build/push, CA trust, pull secret, demo app
+```
+
+`make install` runs `infra-lb` and `harbor-ha` in one go. Before `make deploy-app`, the host Docker daemon must trust the registry (see below). The single-node baseline values (`hack/config/harbor.yaml`) are no longer used by any target.
 
 ### Topology and placement
 
@@ -112,6 +120,11 @@ curl -s -o /dev/null -w '%{http_code}\n' http://172.20.0.100/                   
 
 ### Things to know
 
+- **Harbor rolling updates rely on `topologySpreadConstraints` with `matchLabelKeys: [pod-template-hash]`, not a required `podAntiAffinity`.** Without `matchLabelKeys` old and new pods are counted together and a rollout can leave both replicas on one node (running pods are never rebalanced). With 2 replicas on 2 `app` nodes a required anti-affinity deadlocks every rolling update (the surge pod has no third node and `maxUnavailable` rounds down to 0). `harbor-lb` keeps anti-affinity but rolls with `maxSurge: 0`. Keep this in mind for any new 2-replica workload on a 2-node role.
+- **The Harbor token key must be PKCS#1** (`BEGIN RSA PRIVATE KEY`). A PKCS#8 key makes core answer 500 on `/v2/` (`unable to get PrivateKey from PEM type: PRIVATE KEY`); `hack/install-harbor-ha.sh` generates it correctly. If `harbor-ha-token` was created by an older version of the script, delete the Secret and re-run `make harbor-ha`.
+- **jobservice restarts 2-3 times on first start** (core is not accepting connections yet) and then runs normally.
+- **The demo app runs on the control-plane node** (workers are tainted by role, and `deploy-app.sh` installs Harbor's CA only there); `deployment.yml` and the `helm-hello-kube` chart carry the matching `nodeSelector`/toleration.
+- **The Harbor chart resolves `existingSecret` with `lookup` at render time**, so the Secrets must exist before `helm install`; `helm template` without a cluster shows empty passwords. Use `DRY_RUN=1 make harbor-ha`.
 - **Image pulls can fail transiently** on a cold start (`ErrImagePull`/`ImagePullBackOff`, e.g. Docker Hub token fetch errors or a quay.io `NotFound`). Kubernetes retries and the pods recover on their own; do not re-create the cluster because of it.
 - **The PostgreSQL+Patroni image is built locally** (`make pg-image`, run by `make postgres`) and loaded with `kind load` into the two `pg` nodes only (`imagePullPolicy: Never`). It disappears with the cluster; `make postgres` rebuilds it. It needs Docker Hub and PyPI access at build time.
 - **HAProxy does not reload on config change.** After editing `haproxy-config` in `hack/ha/haproxy.yaml`, bump the `config-version` pod annotation so the Deployment rolls.
@@ -120,13 +133,7 @@ curl -s -o /dev/null -w '%{http_code}\n' http://172.20.0.100/                   
 - **Consul has no ACL/TLS, Redis Sentinel has no password, PostgreSQL replication is asynchronous** - deliberate for the lab (backlog D8).
 - Failure behaviour (Patroni failover, Sentinel failover, losing an HAProxy) has **not** been tested yet: those checks belong to milestone 2 (Phase 4) and count only after milestone 1 is accepted.
 
-## Baseline: single-node Harbor (inherited, currently not usable on this cluster)
-
-```bash
-make add-host      # adds "$LB_IP core.harbor.domain" to /etc/hosts (sudo)
-make install       # infra-lb, then Harbor with baseline values
-make deploy-app    # project, image build/push, CA trust, pull secret, demo app
-```
+## Host setup, Harbor and demo app
 
 `make help` lists all targets. Overridable variables: `CLUSTER`, `KIND_IMAGE`, `KIND_VERSION`, `LB_IP`, `HARBOR_HOST`, `LOCALBIN`, `PG_IMAGE`.
 

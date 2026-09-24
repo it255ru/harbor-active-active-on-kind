@@ -94,6 +94,12 @@ metadata:
   namespace: harbor-deps
 spec:
   replicas: 2
+  # required podAntiAffinity + 2 lb nodes: a surge pod could never be scheduled, so roll one pod at a time
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 0
+      maxUnavailable: 1
   selector:
     matchLabels:
       app: harbor-lb
@@ -103,7 +109,7 @@ spec:
         app: harbor-lb
       annotations:
         # roll pods when the config changes
-        config-version: "1"
+        config-version: "2"
     spec:
       nodeSelector:
         harbor-ha/role: lb

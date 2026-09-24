@@ -1,0 +1,153 @@
+# Harbor in active-active mode (backlog H3.1). Chart 1.19.2 keys verified against
+# `helm show values harbor/harbor --version 1.19.2`.
+# All secrets live in Secrets harbor-ha-secrets / harbor-ha-s3 / harbor-ha-token (created by hack/install-harbor-ha.sh).
+#
+# Placement: every Harbor component runs on the `app` nodes, replicas on different nodes
+# (YAML anchors &appNode / &appToleration are expanded by Helm's YAML parser).
+externalURL: https://core.harbor.domain
+
+expose:
+  type: ingress
+  tls:
+    enabled: true
+    certSource: auto
+  ingress:
+    hosts:
+      core: core.harbor.domain
+    className: nginx
+
+# Registry blobs go to MinIO and job logs to the database, so no shared RWX volume is needed;
+# the only PVC left is Trivy's cache (StatefulSet volumeClaimTemplate, ReadWriteOnce per replica).
+persistence:
+  enabled: true
+  imageChartStorage:
+    type: s3
+    disableredirect: true   # MinIO is not reachable from clients, registry must proxy blobs
+    s3:
+      existingSecret: harbor-ha-s3   # keys REGISTRY_STORAGE_S3_ACCESSKEY / REGISTRY_STORAGE_S3_SECRETKEY (loaded whole into registry)
+      region: us-east-1
+      bucket: registry-blobs
+      regionendpoint: http://minio.harbor-deps.svc.cluster.local:9000
+      secure: false
+      v4auth: true
+
+# PostgreSQL: one address, HAProxy sends it to the current Patroni primary (D7).
+database:
+  type: external
+  external:
+    host: harbor-lb.harbor-deps.svc.cluster.local
+    port: "5432"
+    username: harbor
+    coreDatabase: registry
+    existingSecret: harbor-ha-secrets     # key password
+    sslmode: disable
+  # PostgreSQL max_connections is 200 (hack/ha/postgres.yaml): keep the per-pod pool small,
+  # 2 core replicas x maxOpenConns must stay well below it.
+  maxIdleConns: 20
+  maxOpenConns: 50
+
+# Redis: one address, HAProxy sends it to the current master (D3/D7), plain `redis` mode.
+redis:
+  type: external
+  external:
+    addr: harbor-lb.harbor-deps.svc.cluster.local:6379
+    existingSecret: harbor-ha-secrets     # key REDIS_PASSWORD
+
+# Encryption key for data in the database and the stable per-release secrets: they must be
+# identical for all replicas and survive `helm upgrade` (otherwise the chart generates new ones).
+existingSecretSecretKey: harbor-ha-secrets   # key secretKey
+
+nginx:
+  replicas: 1   # not deployed with expose.type=ingress
+
+portal:
+  replicas: 2
+  nodeSelector: &appNode
+    harbor-ha/role: app
+  tolerations: &appToleration
+    - {key: harbor-ha/role, operator: Equal, value: app, effect: NoSchedule}
+  podDisruptionBudget:
+    enabled: true
+    minAvailable: 1
+  # spread over the app nodes; unlike a required podAntiAffinity this does not deadlock rolling
+  # updates (the surge pod needs a third node there, maxUnavailable rounds down to 0 for 2 replicas).
+  # matchLabelKeys is required: without it old and new pods are counted together and a rollout can
+  # leave both replicas on one node (topology spread never rebalances running pods).
+  topologySpreadConstraints:
+    - maxSkew: 1
+      topologyKey: kubernetes.io/hostname
+      whenUnsatisfiable: DoNotSchedule
+      matchLabelKeys: [pod-template-hash]   # spread every revision on its own, so a rollout ends 1+1 again
+      labelSelector:
+        matchLabels: {app: harbor, component: portal}
+
+core:
+  replicas: 2
+  nodeSelector: *appNode
+  tolerations: *appToleration
+  podDisruptionBudget:
+    enabled: true
+    minAvailable: 1
+  # spread over the app nodes; unlike a required podAntiAffinity this does not deadlock rolling
+  # updates (the surge pod needs a third node there, maxUnavailable rounds down to 0 for 2 replicas).
+  # matchLabelKeys is required: without it old and new pods are counted together and a rollout can
+  # leave both replicas on one node (topology spread never rebalances running pods).
+  topologySpreadConstraints:
+    - maxSkew: 1
+      topologyKey: kubernetes.io/hostname
+      whenUnsatisfiable: DoNotSchedule
+      matchLabelKeys: [pod-template-hash]   # spread every revision on its own, so a rollout ends 1+1 again
+      labelSelector:
+        matchLabels: {app: harbor, component: core}
+  existingSecret: harbor-ha-secrets       # key secret
+  existingXsrfSecret: harbor-ha-secrets   # key CSRF_KEY
+  secretName: harbor-ha-token             # TLS secret with the token signing key/cert (stable across upgrades)
+
+jobservice:
+  replicas: 2
+  nodeSelector: *appNode
+  tolerations: *appToleration
+  podDisruptionBudget:
+    enabled: true
+    minAvailable: 1
+  # spread over the app nodes; unlike a required podAntiAffinity this does not deadlock rolling
+  # updates (the surge pod needs a third node there, maxUnavailable rounds down to 0 for 2 replicas).
+  # matchLabelKeys is required: without it old and new pods are counted together and a rollout can
+  # leave both replicas on one node (topology spread never rebalances running pods).
+  topologySpreadConstraints:
+    - maxSkew: 1
+      topologyKey: kubernetes.io/hostname
+      whenUnsatisfiable: DoNotSchedule
+      matchLabelKeys: [pod-template-hash]   # spread every revision on its own, so a rollout ends 1+1 again
+      labelSelector:
+        matchLabels: {app: harbor, component: jobservice}
+  jobLoggers:
+    - database          # `file` would need one ReadWriteMany volume shared by all replicas
+  existingSecret: harbor-ha-secrets       # key JOBSERVICE_SECRET
+
+registry:
+  replicas: 2
+  nodeSelector: *appNode
+  tolerations: *appToleration
+  podDisruptionBudget:
+    enabled: true
+    minAvailable: 1
+  # spread over the app nodes; unlike a required podAntiAffinity this does not deadlock rolling
+  # updates (the surge pod needs a third node there, maxUnavailable rounds down to 0 for 2 replicas).
+  # matchLabelKeys is required: without it old and new pods are counted together and a rollout can
+  # leave both replicas on one node (topology spread never rebalances running pods).
+  topologySpreadConstraints:
+    - maxSkew: 1
+      topologyKey: kubernetes.io/hostname
+      whenUnsatisfiable: DoNotSchedule
+      matchLabelKeys: [pod-template-hash]   # spread every revision on its own, so a rollout ends 1+1 again
+      labelSelector:
+        matchLabels: {app: harbor, component: registry}
+  existingSecret: harbor-ha-secrets       # key REGISTRY_HTTP_SECRET
+
+# Trivy replication is decided in H3.2; one replica for now. Runs on the app nodes as well.
+trivy:
+  enabled: true
+  replicas: 1
+  nodeSelector: *appNode
+  tolerations: *appToleration

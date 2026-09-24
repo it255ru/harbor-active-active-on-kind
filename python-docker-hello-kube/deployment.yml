@@ -27,6 +27,14 @@ spec:
       labels:
         app: hello
     spec:
+      # Workers are tainted by role; the demo app runs on the control-plane node, where
+      # hack/deploy-app.sh installs Harbor's CA for containerd.
+      nodeSelector:
+        node-role.kubernetes.io/control-plane: ""
+      tolerations:
+      - key: node-role.kubernetes.io/control-plane
+        operator: Exists
+        effect: NoSchedule
       containers:
       - name: hello
         image: core.harbor.domain/python/hello:1.0
