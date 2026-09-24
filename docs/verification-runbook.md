@@ -506,6 +506,27 @@ hack/tests/h43-rolling-update.sh registry     # только registry
 
 Если появляются `502` (`http=502`) или паузы около 5 с: смотреть логи core на `proxy error: ... connection refused` и проверить наличие `preStop` (строка в «Диагностике»); `preStop: sleep 15` добавляет `hack/helm-postrender.py` при `make harbor-ha`.
 
+### P4.4 Потеря worker-ноды
+
+Разрушающая проверка: контейнер `app`-ноды убивается без корректной остановки (`docker kill`) и в конце запускается обратно. При сбое скрипта ноду нужно вернуть вручную: `docker start harbor-worker2` (или `harbor-worker`).
+
+```bash
+hack/tests/h44-node-loss.sh harbor-worker2               # нода с trivy; ждёт вытеснения подов (~7 мин)
+EVICT_WAIT=0 hack/tests/h44-node-loss.sh harbor-worker   # без ожидания вытеснения (~3,5 мин)
+```
+
+Что делает: под лёгкой нагрузкой через Infra LB (манифест, блоб, `docker pull`, без повторов в curl) убивает ноду, ждёт `NotReady`, обновления Endpoints, при `EVICT_WAIT=1` — вытеснения подов (~5 мин, `tolerationSeconds: 300`), затем запускает ноду, ждёт `Ready` и `2/2` у всех Deployment'ов Harbor, печатает разбор по фазам (`node-down` до `NotReady`, `endpoints-updated`, `degraded-steady`, `evicted`, `node-up`, `node-ready`, `recovered`).
+
+Ожидается:
+
+- нода `NotReady` примерно через 50 с; в этот момент её поды исчезают из Endpoints;
+- ошибок клиентов нет или единичные `502` у запросов, оборванных в момент падения; `docker pull` завершаются успешно;
+- в фазе `node-down` (до `NotReady`) возможны задержки: манифест/блоб до ~10 с, `docker pull` до ~30 с; после `NotReady` — доли секунды;
+- при ожидании вытеснения (~5 мин) замены core/portal/registry/jobservice в `Pending` (`didn't match pod topology spread constraints`), trivy `Terminating` на мёртвой ноде;
+- после `docker start` нода `Ready` за секунды, Deployment'ы `2/2` примерно за минуту, распределение 1+1 (V11.1), trivy на своей ноде.
+
+Что не проверяется: постоянная потеря ноды без возврата и потеря нод других ролей (pg, redis, consul, lb, s3): это H4.7.
+
 ## Диагностика
 
 | Симптом | Куда смотреть |
@@ -524,6 +545,7 @@ hack/tests/h43-rolling-update.sh registry     # только registry
 | Sentinel часто переключает master, в логах Valkey `AOF fsync is taking too long` | перегрузка диска; `down-after-milliseconds` = 15000 (`SENTINEL SET mymaster down-after-milliseconds 15000` на всех трёх Sentinel); HAProxy сам находит нового master, смотреть V6.1/V7.2 |
 | После очистки пропал `hello:1.0` | артефакт удалён вместе с чужим тегом на том же digest; `make deploy-app` (тот же digest); удалять тестовые артефакты по digest, не по тегу |
 | При rolling update клиенты получают 502, в логах core `proxy error: dial tcp <ClusterIP registry>:5000: connect: connection refused` | под останавливается раньше, чем маршрутизация убрала его; проверить `preStop` у core/registry/portal (`kubectl get deploy harbor-registry -o jsonpath='{.spec.template.spec.containers[*].lifecycle}'`); `preStop` добавляет `hack/helm-postrender.py` при `make harbor-ha` (нужен PyYAML) |
+| После потери ноды поды Harbor остались `Pending` (`didn't match pod topology spread constraints`) | так и должно быть, пока жива одна `app`-нода: `maxSkew: 1` не пускает вторую реплику на ту же ноду; сервис работает на одной реплике, после возврата ноды Deployment'ы возвращаются к `2/2` сами (≈ 1 мин); `harbor-trivy-0` ждёт свою ноду (PVC привязан к ней) |
 | Сбросить один компонент | удалить его Secret **и** PVC (`data-<имя>-N`), затем `make <таргет>`; удалять только Secret нельзя: новый пароль не совпадёт с данными |
 | Всё сломалось | `make cluster-delete && make cluster && make infra-lb && make ha-deps` (около 11 минут) |
 
