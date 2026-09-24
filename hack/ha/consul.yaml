@@ -1,0 +1,121 @@
+# Consul servers x3 on the `consul` nodes (backlog H2.1). DCS for Patroni (D2).
+# Image pinned by digest (backlog "Версии компонентов HA").
+apiVersion: v1
+kind: Service
+metadata:
+  name: consul-headless
+  namespace: harbor-deps
+spec:
+  clusterIP: None
+  publishNotReadyAddresses: true
+  selector:
+    app: consul
+  ports:
+    - {name: http, port: 8500}
+    - {name: serflan, port: 8301}
+    - {name: server, port: 8300}
+    - {name: dns, port: 8600}
+---
+# Stable client address for Patroni: consul.harbor-deps:8500 (any ready server)
+apiVersion: v1
+kind: Service
+metadata:
+  name: consul
+  namespace: harbor-deps
+spec:
+  selector:
+    app: consul
+  ports:
+    - {name: http, port: 8500}
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: consul
+  namespace: harbor-deps
+spec:
+  minAvailable: 2
+  selector:
+    matchLabels:
+      app: consul
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: consul
+  namespace: harbor-deps
+spec:
+  serviceName: consul-headless
+  replicas: 3
+  podManagementPolicy: Parallel
+  selector:
+    matchLabels:
+      app: consul
+  template:
+    metadata:
+      labels:
+        app: consul
+    spec:
+      nodeSelector:
+        harbor-ha/role: consul
+      tolerations:
+        - {key: harbor-ha/role, operator: Equal, value: consul, effect: NoSchedule}
+      affinity:
+        podAntiAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            - labelSelector:
+                matchLabels:
+                  app: consul
+              topologyKey: kubernetes.io/hostname
+      terminationGracePeriodSeconds: 30
+      containers:
+        - name: consul
+          image: hashicorp/consul:1.22.7@sha256:a230dcea0bb107bd7958a912d1429fb7f9d399637de7ffb814b34412b9e8c543
+          env:
+            - name: POD_NAME
+              valueFrom: {fieldRef: {fieldPath: metadata.name}}
+            - name: POD_IP
+              valueFrom: {fieldRef: {fieldPath: status.podIP}}
+          args:
+            - agent
+            - -server
+            - -ui
+            - -datacenter=harbor
+            - -node=$(POD_NAME)
+            - -data-dir=/consul/data
+            - -bind=$(POD_IP)
+            - -advertise=$(POD_IP)
+            - -client=0.0.0.0
+            - -bootstrap-expect=3
+            - -retry-join=consul-0.consul-headless.harbor-deps.svc.cluster.local
+            - -retry-join=consul-1.consul-headless.harbor-deps.svc.cluster.local
+            - -retry-join=consul-2.consul-headless.harbor-deps.svc.cluster.local
+          ports:
+            - {name: http, containerPort: 8500}
+            - {name: serflan, containerPort: 8301}
+            - {name: server, containerPort: 8300}
+            - {name: dns, containerPort: 8600}
+          readinessProbe:
+            exec:
+              command:
+                - sh
+                - -c
+                - 'test -n "$(wget -qO- http://127.0.0.1:8500/v1/status/leader | tr -d \")"'
+            periodSeconds: 5
+            timeoutSeconds: 3
+          livenessProbe:
+            httpGet: {path: /v1/agent/self, port: 8500}
+            initialDelaySeconds: 15
+            periodSeconds: 10
+          resources:
+            requests: {cpu: 50m, memory: 64Mi}
+          volumeMounts:
+            - {name: data, mountPath: /consul/data}
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+      spec:
+        accessModes: [ReadWriteOnce]
+        resources:
+          requests:
+            storage: 1Gi

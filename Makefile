@@ -22,7 +22,7 @@ CLUSTER ?= harbor
 
 .PHONY: cluster
 cluster: kind ## Create the kind cluster.
-	$(KIND) create cluster --name $(CLUSTER) --image $(KIND_IMAGE)
+	$(KIND) create cluster --name $(CLUSTER) --image $(KIND_IMAGE) --config hack/config/kind-cluster.yaml
 
 .PHONY: cluster-delete
 cluster-delete: kind ## Delete the kind cluster.
@@ -56,9 +56,62 @@ $(KIND): $(LOCALBIN)
 
 ##@ Harbor
 
+.PHONY: infra-lb
+infra-lb: ## Install the Infra LB only (MetalLB + ingress-nginx on the lb nodes).
+	@./hack/install-infra.sh
+
 .PHONY: install
 install: ## Install Harbor.
 	@./hack/install.sh
+
+##@ HA dependencies
+
+.PHONY: ha-deps
+ha-deps: consul postgres redis harbor-lb minio ## Install all HA dependencies in order (after `make cluster infra-lb`).
+
+.PHONY: consul
+consul: ## Install Consul x3 (DCS for Patroni) on the consul nodes.
+	@kubectl apply -f hack/ha/00-namespace.yaml -f hack/ha/consul.yaml
+	@kubectl -n harbor-deps rollout status statefulset/consul --timeout=300s
+
+PG_IMAGE ?= harbor-ha/patroni:4.1.5-pg18.6
+
+.PHONY: pg-image
+pg-image: kind ## Build the PostgreSQL+Patroni image and load it into the pg nodes.
+	docker build -t $(PG_IMAGE) hack/ha/patroni
+	$(KIND) load docker-image $(PG_IMAGE) --name $(CLUSTER) --nodes $$(kubectl get nodes -l harbor-ha/role=pg -o name | sed 's|node/||' | paste -sd,)
+
+.PHONY: postgres
+postgres: pg-image ## Install PostgreSQL x2 under Patroni (needs `make consul` first).
+	@kubectl apply -f hack/ha/00-namespace.yaml
+	@kubectl -n harbor-deps get secret pg-credentials >/dev/null 2>&1 || kubectl -n harbor-deps create secret generic pg-credentials \
+	  --from-literal=superuser=$$(openssl rand -hex 16) --from-literal=replication=$$(openssl rand -hex 16) --from-literal=harbor=$$(openssl rand -hex 16)
+	@kubectl apply -f hack/ha/postgres.yaml
+	@kubectl -n harbor-deps rollout status statefulset/pg --timeout=300s
+
+.PHONY: redis
+redis: ## Install Valkey x3 + Sentinel sidecars on the redis nodes.
+	@kubectl apply -f hack/ha/00-namespace.yaml
+	@kubectl -n harbor-deps get secret redis-credentials >/dev/null 2>&1 || kubectl -n harbor-deps create secret generic redis-credentials \
+	  --from-literal=password=$$(openssl rand -hex 16)
+	@kubectl apply -f hack/ha/redis.yaml
+	@kubectl -n harbor-deps rollout status statefulset/redis --timeout=300s
+
+.PHONY: harbor-lb
+harbor-lb: ## Install the Harbor LB (HAProxy x2) in front of PostgreSQL and Redis (needs postgres + redis).
+	@kubectl apply -f hack/ha/00-namespace.yaml -f hack/ha/haproxy.yaml
+	@kubectl -n harbor-deps rollout status deployment/harbor-lb --timeout=180s
+
+.PHONY: minio
+minio: ## Install MinIO on the s3 node + bucket registry-blobs and a scoped user for Harbor.
+	@kubectl apply -f hack/ha/00-namespace.yaml
+	@kubectl -n harbor-deps get secret minio-credentials >/dev/null 2>&1 || kubectl -n harbor-deps create secret generic minio-credentials \
+	  --from-literal=root-user=minioadmin --from-literal=root-password=$$(openssl rand -hex 16) \
+	  --from-literal=harbor-access-key=harbor --from-literal=harbor-secret-key=$$(openssl rand -hex 16)
+	@kubectl -n harbor-deps delete job minio-init --ignore-not-found >/dev/null
+	@kubectl apply -f hack/ha/minio.yaml
+	@kubectl -n harbor-deps rollout status statefulset/minio --timeout=300s
+	@kubectl -n harbor-deps wait --for=condition=complete job/minio-init --timeout=180s
 
 ##@ Demo app
 

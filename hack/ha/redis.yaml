@@ -1,0 +1,178 @@
+# Valkey x3 + Sentinel sidecar per pod on the `redis` nodes (backlog H2.3, D3: Sentinel is an assumption).
+# 1 master + 2 replicas, Sentinel quorum 2. Peers are addressed by stable pod DNS names
+# (sentinel resolve-hostnames/announce-hostnames), so pod IP changes do not break the topology.
+# Password comes from Secret redis-credentials (created by `make redis`, never committed).
+# Image pinned by digest (backlog "Версии компонентов HA").
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: redis-scripts
+  namespace: harbor-deps
+data:
+  common.sh: |
+    DOMAIN=redis-headless.harbor-deps.svc.cluster.local
+    SELF="$(hostname).$DOMAIN"
+    # Ask the sentinels who the current master is; empty output if none answers.
+    find_master() {
+      for i in 0 1 2; do
+        r=$(timeout 3 valkey-cli -h "redis-$i.$DOMAIN" -p 26379 sentinel get-master-addr-by-name mymaster 2>/dev/null | head -1)
+        if [ -n "$r" ]; then echo "$r"; return 0; fi
+      done
+      return 1
+    }
+  start-valkey.sh: |
+    #!/bin/sh
+    set -e
+    . /scripts/common.sh
+    MASTER=$(find_master || true)
+    if [ -z "$MASTER" ] && [ "$(hostname)" != redis-0 ]; then MASTER="redis-0.$DOMAIN"; fi
+    set -- --bind 0.0.0.0 --protected-mode no --dir /data --appendonly yes \
+      --requirepass "$REDIS_PASSWORD" --masterauth "$REDIS_PASSWORD" --replica-announce-ip "$SELF"
+    if [ -n "$MASTER" ] && [ "$MASTER" != "$SELF" ]; then
+      set -- "$@" --replicaof "$MASTER" 6379
+    fi
+    echo "starting valkey as $([ -n "$MASTER" ] && [ "$MASTER" != "$SELF" ] && echo "replica of $MASTER" || echo master)"
+    exec valkey-server "$@"
+  start-sentinel.sh: |
+    #!/bin/sh
+    set -e
+    . /scripts/common.sh
+    CONF=/data/sentinel.conf
+    if [ ! -f "$CONF" ]; then
+      MASTER=$(find_master || true)
+      [ -n "$MASTER" ] || MASTER="redis-0.$DOMAIN"
+      # sentinel refuses to load a monitor line whose hostname does not resolve yet
+      n=0; until getent hosts "$MASTER" >/dev/null 2>&1; do n=$((n+1)); [ $n -gt 60 ] && exit 1; sleep 1; done
+      cat > "$CONF" <<CFG
+    port 26379
+    dir /data
+    sentinel resolve-hostnames yes
+    sentinel announce-hostnames yes
+    sentinel announce-ip $SELF
+    sentinel monitor mymaster $MASTER 6379 2
+    sentinel auth-pass mymaster $REDIS_PASSWORD
+    sentinel down-after-milliseconds mymaster 5000
+    sentinel failover-timeout mymaster 30000
+    sentinel parallel-syncs mymaster 1
+    CFG
+    fi
+    exec valkey-sentinel "$CONF"
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: redis-headless
+  namespace: harbor-deps
+spec:
+  clusterIP: None
+  publishNotReadyAddresses: true
+  selector:
+    app: redis
+  ports:
+    - {name: redis, port: 6379}
+    - {name: sentinel, port: 26379}
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: redis
+  namespace: harbor-deps
+spec:
+  minAvailable: 2
+  selector:
+    matchLabels:
+      app: redis
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: redis
+  namespace: harbor-deps
+spec:
+  serviceName: redis-headless
+  replicas: 3
+  podManagementPolicy: Parallel
+  selector:
+    matchLabels:
+      app: redis
+  template:
+    metadata:
+      labels:
+        app: redis
+    spec:
+      nodeSelector:
+        harbor-ha/role: redis
+      tolerations:
+        - {key: harbor-ha/role, operator: Equal, value: redis, effect: NoSchedule}
+      affinity:
+        podAntiAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            - labelSelector:
+                matchLabels:
+                  app: redis
+              topologyKey: kubernetes.io/hostname
+      securityContext:
+        runAsUser: 999
+        runAsGroup: 1000
+        fsGroup: 1000
+      terminationGracePeriodSeconds: 30
+      containers:
+        - name: valkey
+          image: valkey/valkey:9.0.6-alpine3.24@sha256:187679e3bd4036959631e3f03983ab2ba503ab21e6fd0454d508e909db2ee989
+          command: [sh, /scripts/start-valkey.sh]
+          env:
+            - {name: REDIS_PASSWORD, valueFrom: {secretKeyRef: {name: redis-credentials, key: password}}}
+            - {name: REDISCLI_AUTH, valueFrom: {secretKeyRef: {name: redis-credentials, key: password}}}
+          ports:
+            - {name: redis, containerPort: 6379}
+          readinessProbe:
+            exec:
+              command: [sh, -c, 'valkey-cli ping | grep -q PONG']
+            periodSeconds: 5
+            timeoutSeconds: 3
+          livenessProbe:
+            exec:
+              command: [sh, -c, 'valkey-cli ping | grep -q PONG']
+            initialDelaySeconds: 15
+            periodSeconds: 10
+            timeoutSeconds: 3
+          resources:
+            requests: {cpu: 50m, memory: 64Mi}
+          volumeMounts:
+            - {name: data, mountPath: /data}
+            - {name: scripts, mountPath: /scripts}
+        - name: sentinel
+          image: valkey/valkey:9.0.6-alpine3.24@sha256:187679e3bd4036959631e3f03983ab2ba503ab21e6fd0454d508e909db2ee989
+          command: [sh, /scripts/start-sentinel.sh]
+          env:
+            - {name: REDIS_PASSWORD, valueFrom: {secretKeyRef: {name: redis-credentials, key: password}}}
+          ports:
+            - {name: sentinel, containerPort: 26379}
+          readinessProbe:
+            exec:
+              command: [sh, -c, 'valkey-cli -p 26379 ping | grep -q PONG']
+            periodSeconds: 5
+            timeoutSeconds: 3
+          livenessProbe:
+            exec:
+              command: [sh, -c, 'valkey-cli -p 26379 ping | grep -q PONG']
+            initialDelaySeconds: 15
+            periodSeconds: 10
+            timeoutSeconds: 3
+          resources:
+            requests: {cpu: 20m, memory: 32Mi}
+          volumeMounts:
+            - {name: data, mountPath: /data}
+            - {name: scripts, mountPath: /scripts}
+      volumes:
+        - name: scripts
+          configMap:
+            name: redis-scripts
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+      spec:
+        accessModes: [ReadWriteOnce]
+        resources:
+          requests:
+            storage: 1Gi

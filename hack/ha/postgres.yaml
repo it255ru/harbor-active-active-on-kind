@@ -1,0 +1,151 @@
+# PostgreSQL x2 under Patroni, state in Consul (backlog H2.2, D2).
+# Credentials come from Secret pg-credentials (created by `make postgres`, never committed).
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: patroni-config
+  namespace: harbor-deps
+data:
+  patroni.yml: |
+    scope: harbor-pg
+    namespace: /service/
+    consul:
+      host: consul.harbor-deps:8500
+    restapi:
+      listen: 0.0.0.0:8008
+    bootstrap:
+      dcs:
+        ttl: 30
+        loop_wait: 10
+        retry_timeout: 10
+        maximum_lag_on_failover: 1048576
+        postgresql:
+          use_pg_rewind: true
+          use_slots: true
+          parameters:
+            max_connections: 200
+            wal_level: replica
+            hot_standby: "on"
+            max_wal_senders: 10
+            max_replication_slots: 10
+      initdb:
+        - encoding: UTF8
+        - data-checksums
+      pg_hba:
+        - local all all trust
+        - host replication replicator 10.244.0.0/16 scram-sha-256
+        - host all all 10.244.0.0/16 scram-sha-256
+      post_bootstrap: /scripts/post-bootstrap.sh
+    postgresql:
+      listen: 0.0.0.0:5432
+      data_dir: /var/lib/postgresql/data/pgdata
+      pgpass: /tmp/pgpass
+  post-bootstrap.sh: |
+    #!/bin/sh
+    # $1 = connection URL of the freshly bootstrapped primary
+    set -e
+    psql "$1" -v ON_ERROR_STOP=1 -v pw="$HARBOR_DB_PASSWORD" <<'SQL'
+    CREATE ROLE harbor LOGIN PASSWORD :'pw';
+    CREATE DATABASE registry OWNER harbor ENCODING 'UTF8';
+    SQL
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: pg-headless
+  namespace: harbor-deps
+spec:
+  clusterIP: None
+  publishNotReadyAddresses: true
+  selector:
+    app: pg
+  ports:
+    - {name: postgres, port: 5432}
+    - {name: patroni, port: 8008}
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: pg
+  namespace: harbor-deps
+spec:
+  minAvailable: 1
+  selector:
+    matchLabels:
+      app: pg
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: pg
+  namespace: harbor-deps
+spec:
+  serviceName: pg-headless
+  replicas: 2
+  podManagementPolicy: OrderedReady
+  selector:
+    matchLabels:
+      app: pg
+  template:
+    metadata:
+      labels:
+        app: pg
+    spec:
+      nodeSelector:
+        harbor-ha/role: pg
+      tolerations:
+        - {key: harbor-ha/role, operator: Equal, value: pg, effect: NoSchedule}
+      affinity:
+        podAntiAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            - labelSelector:
+                matchLabels:
+                  app: pg
+              topologyKey: kubernetes.io/hostname
+      securityContext:
+        fsGroup: 70
+      terminationGracePeriodSeconds: 60
+      containers:
+        - name: patroni
+          image: harbor-ha/patroni:4.1.5-pg18.6
+          imagePullPolicy: Never  # loaded into the pg nodes by `make pg-image`
+          env:
+            - {name: PATRONI_NAME, valueFrom: {fieldRef: {fieldPath: metadata.name}}}
+            - {name: POD_IP, valueFrom: {fieldRef: {fieldPath: status.podIP}}}
+            - {name: PATRONI_RESTAPI_CONNECT_ADDRESS, value: "$(POD_IP):8008"}
+            - {name: PATRONI_POSTGRESQL_CONNECT_ADDRESS, value: "$(POD_IP):5432"}
+            - {name: PATRONI_SUPERUSER_USERNAME, value: postgres}
+            - {name: PATRONI_SUPERUSER_PASSWORD, valueFrom: {secretKeyRef: {name: pg-credentials, key: superuser}}}
+            - {name: PATRONI_REPLICATION_USERNAME, value: replicator}
+            - {name: PATRONI_REPLICATION_PASSWORD, valueFrom: {secretKeyRef: {name: pg-credentials, key: replication}}}
+            - {name: HARBOR_DB_PASSWORD, valueFrom: {secretKeyRef: {name: pg-credentials, key: harbor}}}
+          ports:
+            - {name: postgres, containerPort: 5432}
+            - {name: patroni, containerPort: 8008}
+          readinessProbe:
+            httpGet: {path: /readiness, port: 8008}
+            periodSeconds: 5
+          livenessProbe:
+            httpGet: {path: /liveness, port: 8008}
+            initialDelaySeconds: 30
+            periodSeconds: 10
+            failureThreshold: 6
+          resources:
+            requests: {cpu: 100m, memory: 256Mi}
+          volumeMounts:
+            - {name: data, mountPath: /var/lib/postgresql/data}
+            - {name: config, mountPath: /etc/patroni}
+            - {name: config, mountPath: /scripts}
+      volumes:
+        - name: config
+          configMap:
+            name: patroni-config
+            defaultMode: 0555
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+      spec:
+        accessModes: [ReadWriteOnce]
+        resources:
+          requests:
+            storage: 5Gi

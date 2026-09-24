@@ -1,0 +1,27 @@
+# Infra LB placement (backlog H1.2): MetalLB runs only on the `lb` nodes.
+# Every worker carries a harbor-ha/role NoSchedule taint, so tolerations are required.
+controller:
+  nodeSelector:
+    harbor-ha/role: lb
+  tolerations:
+    - key: harbor-ha/role
+      operator: Equal
+      value: lb
+      effect: NoSchedule
+speaker:
+  nodeSelector:
+    harbor-ha/role: lb
+  tolerations:
+    - key: harbor-ha/role
+      operator: Equal
+      value: lb
+      effect: NoSchedule
+frr-k8s:
+  frrk8s:
+    nodeSelector:
+      harbor-ha/role: lb
+    tolerations:
+      - key: harbor-ha/role
+        operator: Equal
+        value: lb
+        effect: NoSchedule

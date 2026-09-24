@@ -1,0 +1,143 @@
+# Harbor LB (backlog H2.4, D7): HAProxy x2 on the `lb` nodes in front of PostgreSQL and Redis.
+# Harbor connects to a single address: harbor-lb.harbor-deps:5432 (PG primary) and :6379 (Redis master).
+#   PG:    HTTP check GET /primary on Patroni REST (8008) -> 200 only on the leader
+#   Redis: tcp-check AUTH + INFO replication, expects role:master
+# Image pinned by digest (backlog "Версии компонентов HA").
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: haproxy-config
+  namespace: harbor-deps
+data:
+  haproxy.cfg: |
+    global
+      log stdout format raw local0
+      maxconn 4096
+
+    defaults
+      mode tcp
+      log global
+      timeout connect 5s
+      timeout client 30m
+      timeout server 30m
+      timeout check 3s
+
+    resolvers k8s
+      parse-resolv-conf
+      resolve_retries 3
+      timeout resolve 1s
+      timeout retry 1s
+      hold valid 5s
+
+    frontend health
+      mode http
+      bind :8404
+      monitor-uri /healthz
+      stats enable
+      stats uri /stats
+      stats refresh 5s
+
+    listen postgres
+      bind :5432
+      option httpchk
+      http-check send meth GET uri /primary
+      http-check expect status 200
+      default-server check port 8008 inter 3s fall 3 rise 2 on-marked-down shutdown-sessions resolvers k8s init-addr none resolve-prefer ipv4
+      server pg-0 pg-0.pg-headless.harbor-deps.svc.cluster.local:5432
+      server pg-1 pg-1.pg-headless.harbor-deps.svc.cluster.local:5432
+
+    listen redis
+      bind :6379
+      option tcp-check
+      tcp-check connect
+      tcp-check send "AUTH ${REDIS_PASSWORD}\r\n"
+      tcp-check expect string +OK
+      tcp-check send "PING\r\n"
+      tcp-check expect string +PONG
+      tcp-check send "INFO replication\r\n"
+      tcp-check expect string role:master
+      tcp-check send "QUIT\r\n"
+      tcp-check expect string +OK
+      default-server check inter 3s fall 3 rise 2 on-marked-down shutdown-sessions resolvers k8s init-addr none resolve-prefer ipv4
+      server redis-0 redis-0.redis-headless.harbor-deps.svc.cluster.local:6379
+      server redis-1 redis-1.redis-headless.harbor-deps.svc.cluster.local:6379
+      server redis-2 redis-2.redis-headless.harbor-deps.svc.cluster.local:6379
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: harbor-lb
+  namespace: harbor-deps
+spec:
+  selector:
+    app: harbor-lb
+  ports:
+    - {name: postgres, port: 5432}
+    - {name: redis, port: 6379}
+    - {name: stats, port: 8404}
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: harbor-lb
+  namespace: harbor-deps
+spec:
+  minAvailable: 1
+  selector:
+    matchLabels:
+      app: harbor-lb
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: harbor-lb
+  namespace: harbor-deps
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: harbor-lb
+  template:
+    metadata:
+      labels:
+        app: harbor-lb
+      annotations:
+        # roll pods when the config changes
+        config-version: "1"
+    spec:
+      nodeSelector:
+        harbor-ha/role: lb
+      tolerations:
+        - {key: harbor-ha/role, operator: Equal, value: lb, effect: NoSchedule}
+      affinity:
+        podAntiAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            - labelSelector:
+                matchLabels:
+                  app: harbor-lb
+              topologyKey: kubernetes.io/hostname
+      containers:
+        - name: haproxy
+          image: haproxy:3.4.4-alpine3.24@sha256:52c5921e1619f39cbd5b25e1b4b5847667917f39745056cf004d9c263fbf11b9
+          args: [-f, /usr/local/etc/haproxy/haproxy.cfg]
+          env:
+            - {name: REDIS_PASSWORD, valueFrom: {secretKeyRef: {name: redis-credentials, key: password}}}
+          ports:
+            - {name: postgres, containerPort: 5432}
+            - {name: redis, containerPort: 6379}
+            - {name: stats, containerPort: 8404}
+          readinessProbe:
+            httpGet: {path: /healthz, port: 8404}
+            periodSeconds: 5
+          livenessProbe:
+            httpGet: {path: /healthz, port: 8404}
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          resources:
+            requests: {cpu: 50m, memory: 32Mi}
+          volumeMounts:
+            - {name: config, mountPath: /usr/local/etc/haproxy, readOnly: true}
+      volumes:
+        - name: config
+          configMap:
+            name: haproxy-config
