@@ -1,4 +1,4 @@
-## ⚓ KinD Harbor : Deploy Harbor locally using KinD
+## ⚓ harbor-on-kind : Deploy Harbor locally using KinD
 
 ### Requirenments
 - Linux laptop/workstation
@@ -340,7 +340,7 @@ Package the application as a helm chart and upload it to a harbor helm chart reg
 ```
 helm package hello-kube
 $ helm package hello-kube
-Successfully packaged chart and saved it to: /tmp/kind-harbor-playground/hello-kube-0.1.0.tgz
+Successfully packaged chart and saved it to: /tmp/harbor-on-kind/hello-kube-0.1.0.tgz
 
 ```
 ### Push Helm Chart to OCI registry:

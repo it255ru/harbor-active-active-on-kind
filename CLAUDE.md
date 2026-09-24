@@ -1,6 +1,6 @@
 # CLAUDE.md
 
-Local lab: **Harbor** on a single-node **KinD** cluster (MetalLB + ingress-nginx in front), plus a tiny stdlib-only Python app that is built, pushed to Harbor, and deployed via raw YAML or a Helm chart. No application code to speak of, no tests, no CI — the "code" is a Makefile, a few shell scripts, and Helm/K8s YAML.
+Repo: **harbor-on-kind**. Local lab: **Harbor** on a single-node **KinD** cluster (MetalLB + ingress-nginx in front), plus a tiny stdlib-only Python app that is built, pushed to Harbor, and deployed via raw YAML or a Helm chart. No application code to speak of, no tests, no CI — the "code" is a Makefile, a few shell scripts, and Helm/K8s YAML.
 
 See also: `AGENTS.md` (agent orientation), `README.md` (human runbook — now current, updated in Phase 6).
 

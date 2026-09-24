@@ -1,4 +1,4 @@
-# Agent context: kind-harbor-playground
+# Agent context: harbor-on-kind
 
 Local playground: **Harbor** on a **KinD** Kubernetes cluster, plus a tiny stdlib-only Python app (no pip deps) pushed to Harbor and deployed via kubectl/Helm.
 
