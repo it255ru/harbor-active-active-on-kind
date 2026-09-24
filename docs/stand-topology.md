@@ -164,6 +164,7 @@ flowchart TB
 | `minio-credentials` | `harbor-deps` | root-пользователь MinIO; `harbor-access-key`/`harbor-secret-key` (пользователь `harbor` только на бакет) | `make minio` |
 | `harbor-ha-secrets` | `default` | пароль БД и Redis для Harbor, `secret`, `CSRF_KEY`, `JOBSERVICE_SECRET`, `REGISTRY_HTTP_SECRET`, `secretKey` | `make harbor-ha` |
 | `harbor-ha-s3` | `default` | S3-ключи для registry | `make harbor-ha` |
+| `harbor-ha-ingress-tls` | `default` | CA (`ca.crt`) и сертификат ingress для `core.harbor.domain` (`tls.crt`, `tls.key`), 10 лет; CA стабилен между `helm upgrade` | `make harbor-ha` |
 | `harbor-ha-token` | `default` | пара ключей подписи токенов (PKCS#1), общая для реплик core | `make harbor-ha` |
 | `harbor` | `default` | pull secret для demo-приложения | `make deploy-app` |
 

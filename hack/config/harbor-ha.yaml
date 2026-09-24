@@ -6,11 +6,19 @@
 # (YAML anchors &appNode / &appToleration are expanded by Helm's YAML parser).
 externalURL: https://core.harbor.domain
 
+# CA served at /api/v2.0/systeminfo/getcert and used by `make deploy-app` to trust the registry
+# (Secret key ca.crt; needed because the certificate is not auto-generated)
+caSecretName: harbor-ha-ingress-tls
+
 expose:
   type: ingress
   tls:
     enabled: true
-    certSource: auto
+    # `auto` would regenerate the CA on every helm upgrade and break the nodes' trust in the registry;
+    # the certificate and CA come from Secret harbor-ha-ingress-tls, created once by install-harbor-ha.sh
+    certSource: secret
+    secret:
+      secretName: harbor-ha-ingress-tls
   ingress:
     hosts:
       core: core.harbor.domain

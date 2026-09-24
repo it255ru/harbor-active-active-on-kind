@@ -527,6 +527,26 @@ EVICT_WAIT=0 hack/tests/h44-node-loss.sh harbor-worker   # без ожидани
 
 Что не проверяется: постоянная потеря ноды без возврата и потеря нод других ролей (pg, redis, consul, lb, s3): это H4.7.
 
+### P4.5 demo-app: rollout после push нового тега
+
+Не разрушает данные (вариант `DEGRADE=1` убивает по одному поду registry и core, они пересоздаются). Проверяет полный цикл доставки: push тега в Harbor, rollout приложения, pull образа kubelet-ом из Harbor, распределение запросов по репликам.
+
+```bash
+hack/tests/h45-app-rollout.sh                # Harbor целиком
+DEGRADE=1 hack/tests/h45-app-rollout.sh      # перед rollout убиты один registry и один core
+```
+
+Ожидается:
+
+- `docker push` нового тега завершается с `digest: sha256:...`;
+- `rollout status` заканчивается `successfully rolled out` (порядка 10 с);
+- новые поды на `imageID` = запушенному digest (блок `new pods`);
+- в событиях kubelet для нового тега `Pulling` и `Successfully pulled image ...` (без `ErrImagePull`);
+- пробник: `0 failed`; до rollout отвечают обе старые реплики, после — обе новые (`pods answering`), в конце 40 запросов делятся между ними;
+- скрипт возвращает `hello:1.0` и удаляет тестовый артефакт по digest (`delete test artifact by digest: 200`).
+
+Если новый под в `ErrImagePull` с `x509: certificate signed by unknown authority` — containerd ноды не доверяет текущему CA Harbor (см. «Диагностику»). После завершения проверить, что `hello:1.0` на месте: `curl -sk -u admin:Harbor12345 https://core.harbor.domain/api/v2.0/projects/python/repositories/hello/artifacts`.
+
 ## Диагностика
 
 | Симптом | Куда смотреть |
@@ -546,6 +566,7 @@ EVICT_WAIT=0 hack/tests/h44-node-loss.sh harbor-worker   # без ожидани
 | После очистки пропал `hello:1.0` | артефакт удалён вместе с чужим тегом на том же digest; `make deploy-app` (тот же digest); удалять тестовые артефакты по digest, не по тегу |
 | При rolling update клиенты получают 502, в логах core `proxy error: dial tcp <ClusterIP registry>:5000: connect: connection refused` | под останавливается раньше, чем маршрутизация убрала его; проверить `preStop` у core/registry/portal (`kubectl get deploy harbor-registry -o jsonpath='{.spec.template.spec.containers[*].lifecycle}'`); `preStop` добавляет `hack/helm-postrender.py` при `make harbor-ha` (нужен PyYAML) |
 | После потери ноды поды Harbor остались `Pending` (`didn't match pod topology spread constraints`) | так и должно быть, пока жива одна `app`-нода: `maxSkew: 1` не пускает вторую реплику на ту же ноду; сервис работает на одной реплике, после возврата ноды Deployment'ы возвращаются к `2/2` сами (≈ 1 мин); `harbor-trivy-0` ждёт свою ноду (PVC привязан к ней) |
+| Новые pod-ы приложения в `ErrImagePull`: `x509: certificate signed by unknown authority` при pull с `core.harbor.domain` | containerd ноды не доверяет текущему CA Harbor. С `harbor-ha-ingress-tls` CA стабилен и не меняется при `helm upgrade`; если ошибка есть, сравнить серийники: `curl -sk https://core.harbor.domain/api/v2.0/systeminfo/getcert \| openssl x509 -noout -serial` и `docker exec harbor-control-plane openssl x509 -in /usr/local/share/ca-certificates/harbor-ca.crt -noout -serial`; при различии `make deploy-app` (переустанавливает доверие) |
 | Сбросить один компонент | удалить его Secret **и** PVC (`data-<имя>-N`), затем `make <таргет>`; удалять только Secret нельзя: новый пароль не совпадёт с данными |
 | Всё сломалось | `make cluster-delete && make cluster && make infra-lb && make ha-deps` (около 11 минут) |
 
