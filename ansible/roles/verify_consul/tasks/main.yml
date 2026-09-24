@@ -1,0 +1,31 @@
+# V4: Consul raft and the Patroni state in the KV store.
+- name: V4 | raft peers, members, Patroni leader key
+  kubernetes.core.k8s_exec:
+    namespace: "{{ deps_ns }}"
+    pod: consul-0
+    command: "{{ item }}"
+  loop:
+    - consul operator raft list-peers
+    - consul members
+    - consul kv get service/harbor-pg/leader
+  register: v4
+  failed_when: false
+  changed_when: false
+
+- name: V4 | record
+  vars:
+    peers: "{{ v4.results[0].stdout | default('') | split('\n') | select('search', ' (leader|follower) ') | list }}"
+    members: "{{ v4.results[1].stdout | default('') | split('\n') | select('search', ' alive +server ') | list }}"
+    pg_leader: "{{ v4.results[2].stdout | default('') | trim }}"
+    leaders: "{{ peers | select('search', ' leader ') | list | length }}"
+    lag_ok: "{{ peers | select('search', ' follower ') | select('search', ' 0 commits') | list | length }}"
+    voters: "{{ peers | select('search', ' true ') | list | length }}"
+  ansible.builtin.set_fact:
+    verify_results: >-
+      {{ verify_results + [
+        {'id': 'V4.1', 't': 'Consul raft: 3 voters, 1 leader, followers 0 commits behind, 3 alive servers',
+         's': 'PASS' if (peers | length == 3 and leaders | int == 1 and voters | int == 3 and lag_ok | int == 2 and members | length == 3) else 'FAIL',
+         'd': '%d peers, %s leader, %s voters, %s followers in sync, %d alive' | format(peers | length, leaders, voters, lag_ok, members | length)},
+        {'id': 'V4.2', 't': 'Patroni state in Consul (service/harbor-pg/leader)',
+         's': 'PASS' if pg_leader in ['pg-0', 'pg-1'] else 'FAIL', 'd': 'leader ' ~ (pg_leader or 'none')}
+      ] }}

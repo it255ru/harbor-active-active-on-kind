@@ -1,0 +1,26 @@
+# Source of truth for the numbers below: hack/config/kind-cluster.yaml, Makefile (LB_IP), docs/stand-topology.md.
+kube_context: kind-harbor
+deps_ns: harbor-deps            # hack/ha/00-namespace.yaml
+app_ns: default                 # namespace of Harbor, ingress-nginx and the demo app
+
+lb_ip: 172.20.0.100             # Infra LB (Makefile LB_IP)
+demo_ip: 172.20.0.101           # LoadBalancer of the demo app
+kind_subnet: 172.20.0.0/16      # docker network "kind"
+lb_pool: 172.20.0.100-172.20.0.110
+
+harbor_host: core.harbor.domain
+harbor_admin_user: admin
+harbor_admin_password: Harbor12345   # lab default only (see CLAUDE.md), never a real credential
+
+expected_nodes: 14
+expected_roles: {app: 2, lb: 2, pg: 2, redis: 3, consul: 3, s3: 1}
+expected_tainted_nodes: 13      # every worker; the control-plane has its own taint
+
+# Images for the reachability jobs (V9); the same pins as in hack/ha/*.yaml.
+image_pg: postgres:18.6-alpine3.24@sha256:77f585114c32fbca283dc835b0596f4e52b51b4c6662d7810b2f4084f60a1873
+image_valkey: valkey/valkey:9.0.6-alpine3.24@sha256:187679e3bd4036959631e3f03983ab2ba503ab21e6fd0454d508e909db2ee989
+
+# Switches. The checks that write (V5.4, V6.3, V9, V11.6) clean up after themselves.
+verify_writes: true             # V5.4, V6.3, V9.x: temporary table/key/Job
+verify_rollout: false           # V11.6: kubectl rollout restart deploy/harbor-core (replaces pods, run when calm)
+verify_load_requests: 100       # V12: requests per component

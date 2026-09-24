@@ -1,0 +1,70 @@
+---
+# Ansible port of docs/verification-runbook.md (checks V1..V12, backlog H5.4).
+#   make verify                          # everything
+#   make verify TAGS=V5,V6               # selected sections
+#   ansible-playbook verify.yml -e verify_rollout=true
+# Checks only read (V5.4, V6.3, V9, V11.6 write and clean up). Every check is recorded in verify_results;
+# the summary at the end prints the table and the play fails when any check is FAIL. WARN/INFO never fail.
+# Failure scenarios (P4.1..P4.7) are not here: they stay in hack/tests/*.sh.
+- name: Verify the Harbor HA stand
+  hosts: localhost
+  gather_facts: false
+  module_defaults:
+    kubernetes.core.k8s_info: {context: "{{ kube_context }}"}
+    kubernetes.core.k8s_exec: {context: "{{ kube_context }}"}
+    kubernetes.core.k8s_log: {context: "{{ kube_context }}"}
+    kubernetes.core.k8s: {context: "{{ kube_context }}"}
+
+  pre_tasks:
+    - name: Init | results and the node/role map
+      tags: [always]
+      block:
+        - name: Init | all nodes
+          kubernetes.core.k8s_info: {kind: Node}
+          register: all_nodes
+        - name: Init | role of every node ("none" = control-plane)
+          ansible.builtin.set_fact:
+            verify_results: []
+            role_of: >-
+              {%- set m = {} -%}
+              {%- for n in all_nodes.resources -%}
+              {%- set _ = m.update({n.metadata.name: n.metadata.labels.get('harbor-ha/role', 'none')}) -%}
+              {%- endfor -%}
+              {{ m }}
+
+  roles:
+    - {role: verify_cluster,   tags: [V1]}
+    - {role: verify_pods,      tags: [V2]}
+    - {role: verify_infra_lb,  tags: [V3]}
+    - {role: verify_consul,    tags: [V4]}
+    - {role: verify_postgres,  tags: [V5]}
+    - {role: verify_redis,     tags: [V6]}
+    - {role: verify_haproxy,   tags: [V7]}
+    - {role: verify_s3,        tags: [V8]}
+    - {role: verify_reach,     tags: [V9]}
+    - {role: verify_host,      tags: [V10]}
+    - {role: verify_harbor,    tags: [V11]}
+    - {role: verify_load,      tags: [V12]}
+
+  post_tasks:
+    - name: Summary | table
+      tags: [always]
+      vars:
+        table: >-
+          {%- set out = [] -%}
+          {%- for r in verify_results -%}
+          {%- set _ = out.append('%-5s %-7s %s%s' | format(r.s, r.id, r.t, (' | ' ~ r.d) if r.d else '')) -%}
+          {%- endfor -%}
+          {{ out }}
+        n_fail: "{{ verify_results | selectattr('s', 'eq', 'FAIL') | list | length }}"
+        n_pass: "{{ verify_results | selectattr('s', 'eq', 'PASS') | list | length }}"
+        n_warn: "{{ verify_results | selectattr('s', 'in', ['WARN', 'INFO']) | list | length }}"
+      block:
+        - name: Summary | results
+          ansible.builtin.debug:
+            msg: "{{ table + ['', '%d passed, %d failed, %d warnings/info' | format(n_pass | int, n_fail | int, n_warn | int)] }}"
+        - name: Summary | fail when any check failed
+          ansible.builtin.assert:
+            that: n_fail | int == 0
+            fail_msg: "{{ n_fail }} check(s) FAILED: {{ verify_results | selectattr('s', 'eq', 'FAIL') | map(attribute='id') | join(', ') }}"
+            quiet: true

@@ -1,0 +1,58 @@
+# V2: pod health and placement.
+- name: V2 | pods and warning events
+  kubernetes.core.k8s_info:
+    kind: "{{ item }}"
+  loop: [Pod, Event]
+  register: v2_raw
+
+- name: V2 | record
+  vars:
+    pods: "{{ v2_raw.results[0].resources }}"
+    events: "{{ v2_raw.results[1].resources | selectattr('type', 'eq', 'Warning') | list }}"
+    not_running: >-
+      {{ pods | rejectattr('status.phase', 'in', ['Running', 'Succeeded']) | map(attribute='metadata.name') | list }}
+    restarts: >-
+      {%- set out = [] -%}
+      {%- for p in pods -%}
+      {%- set n = p.status.get('containerStatuses', []) | sum(attribute='restartCount') -%}
+      {%- if n > 0 -%}{%- set _ = out.append(p.metadata.name ~ '=' ~ n) -%}{%- endif -%}
+      {%- endfor -%}
+      {{ out }}
+    misplaced: >-
+      {%- set out = [] -%}
+      {%- for p in pods if p.metadata.namespace not in ['kube-system', 'local-path-storage'] and p.status.phase == 'Running' -%}
+      {%- set sel = p.spec.get('nodeSelector') or {} -%}
+      {%- set have = role_of.get(p.spec.nodeName, '?') -%}
+      {%- set want = sel.get('harbor-ha/role') -%}
+      {%- if want is none and p.metadata.name is match('^(ingress-nginx|metallb)') -%}{%- set want = 'lb' -%}{%- endif -%}
+      {%- if want is none and 'node-role.kubernetes.io/control-plane' in sel -%}{%- set want = 'none' -%}{%- endif -%}
+      {%- if want is none -%}{%- set _ = out.append('NO-SELECTOR ' ~ p.metadata.name) -%}
+      {%- elif want != have -%}{%- set _ = out.append('MISPLACED ' ~ p.metadata.name ~ ' want ' ~ want ~ ' on ' ~ have) -%}
+      {%- endif -%}
+      {%- endfor -%}
+      {{ out }}
+    dup_apps: >-
+      {%- set seen = {} -%}{%- set out = [] -%}
+      {%- for p in pods if p.metadata.namespace == deps_ns and p.status.phase == 'Running' -%}
+      {%- set key = p.metadata.labels.get('app', p.metadata.name) ~ '@' ~ p.spec.nodeName -%}
+      {%- if key in seen -%}{%- set _ = out.append(key) -%}{%- endif -%}
+      {%- set _ = seen.update({key: 1}) -%}
+      {%- endfor -%}
+      {{ out }}
+    warn_reasons: >-
+      {%- set c = {} -%}
+      {%- for e in events -%}{%- set _ = c.update({e.reason: c.get(e.reason, 0) + 1}) -%}{%- endfor -%}
+      {{ c }}
+  ansible.builtin.set_fact:
+    verify_results: >-
+      {{ verify_results + [
+        {'id': 'V2.1', 't': 'no pods outside Running/Completed', 's': 'PASS' if not_running | length == 0 else 'FAIL',
+         'd': not_running | join(', ')},
+        {'id': 'V2.2', 't': 'no container restarts', 's': 'PASS' if restarts | length == 0 else 'WARN',
+         'd': (restarts | length ~ ' pods: ' ~ restarts[:4] | join(' ') ~ (' ...' if restarts | length > 4 else '')) if restarts else ''},
+        {'id': 'V2.3', 't': 'warning events (informational)', 's': 'INFO', 'd': '%d, by reason: %s' | format(events | length, warn_reasons)},
+        {'id': 'V2.4', 't': 'every pod on a node of its role', 's': 'PASS' if misplaced | length == 0 else 'FAIL',
+         'd': misplaced | join('; ')},
+        {'id': 'V2.5', 't': 'replicas of one app on different nodes (harbor-deps)', 's': 'PASS' if dup_apps | length == 0 else 'FAIL',
+         'd': dup_apps | join(', ')}
+      ] }}

@@ -4,7 +4,7 @@
 
 Ранбук проверяет **состояние и распределение** (веха 1). Отказоустойчивость (падение primary PostgreSQL, master Redis, HAProxy, ноды) сюда не входит: это Phase 4 / веха 2 в `backlog.md`.
 
-Документ написан так, чтобы его можно было механически перевести в Ansible (см. последний раздел): у каждой проверки есть идентификатор, команда, ожидаемый результат и что делать при отказе.
+Те же проверки выполняет плейбук Ansible (`make verify`, последний раздел): у каждой проверки есть идентификатор, команда, ожидаемый результат и что делать при отказе.
 
 ## Подготовка
 
@@ -663,37 +663,28 @@ hack/tests/h47-role-failure.sh lb         # нода, анонсирующая �
 - Отказы и переключения (Patroni failover, Sentinel failover, потеря одного HAProxy, потеря ноды): Phase 4 (H4.x) в `backlog.md`, засчитываются только после приёмки вехи 1 (H3.5).
 - Производительность и нагрузка.
 
-## Перевод в Ansible (план)
+## Ansible-версия (`make verify`)
 
-Цель: те же проверки как воспроизводимый плейбук, который запускается одной командой и даёт сводный отчёт.
+Проверки V1-V12 этого ранбука выполняет плейбук `ansible/verify.yml` (H5.4): одна проверка = одна запись с тем же идентификатором, итог — таблица `PASS`/`FAIL`/`WARN`/`INFO` и ненулевой код возврата, если хоть одна проверка `FAIL`. Разрушающие сценарии (P4.x) остаются скриптами `hack/tests/*.sh`.
 
-**Принципы:**
-
-- Одна проверка = одна задача (или блок) с тем же идентификатором (`V5.1` и т.д.) в `name:`; это даёт готовые теги (`--tags V5`) и читаемый отчёт.
-- Проверки только читают: `changed_when: false`. Проверки с записью (V5.4, V6.3, V8.2, V9.x) используют уникальные ключи/таблицы и обязательно убирают за собой (`always:` в `block`).
-- Ожидаемое значение проверяется через `failed_when`/`assert` (`that:` + `fail_msg:` из колонки «При отказе»), а не глазами.
-- Пароли берутся из Secret'ов кластера (`kubernetes.core.k8s_info` + `b64decode`), задачи с ними — `no_log: true`.
-- Топология не хардкодится: ожидаемые числа нод по ролям, namespace, `LB_IP` — переменные (`group_vars/all.yml`), источник правды — `hack/config/kind-cluster.yaml` и `Makefile`.
-
-**Соответствие модулям:**
-
-| Проверки | Ansible |
-|----------|---------|
-| V1, V2, V3.1, V3.2, V3.4, V7.1, V8.1 | `kubernetes.core.k8s_info` (Node, Pod, Service, Job) + `assert` по ответу; V2.4 и V2.5 — расчёт в Jinja2 по списку подов и нод |
-| V4, V5.1, V5.2, V6.1, V6.2, V7.2 | `kubernetes.core.k8s_exec` (`consul`, `patronictl`, `curl`, `valkey-cli`, `wget`) с разбором вывода (`patronictl list -f json`, CSV статистики HAProxy) |
-| V3.3 | `ansible.builtin.uri` (`status_code: 404`, `validate_certs: false` для HTTPS) |
-| V3.2 (подсеть) | `community.docker.docker_network_info` или `command: docker network inspect` |
-| V5.3, V5.4, V6.3, V8.2, V9 | `kubernetes.core.k8s` (создание и удаление тест-Pod/Job) + чтение логов через `k8s_log`; либо `k8s_exec` в уже существующие поды, где это возможно |
-| V10 | `command: docker stats` / `ansible.builtin.setup` (память и диск хоста), `sysctl` |
-
-**Предполагаемая структура (не создана):**
-
-```text
-ansible/
-  verify.yml                # playbook: роли по разделам, теги V1..V10
-  group_vars/all.yml        # namespace, LB_IP, ожидаемое число нод по ролям
-  roles/verify_cluster/ verify_pods/ verify_infra_lb/ verify_consul/
-        verify_postgres/ verify_redis/ verify_haproxy/ verify_s3/ verify_e2e/ verify_host/
+```bash
+pip install --user kubernetes                       # один раз; коллекция kubernetes.core (>= 3.2.0) нужна тоже
+ansible-galaxy collection install -r ansible/requirements.yml    # если её нет
+make verify                                         # все проверки, около 1,5 минут
+make verify TAGS=V5,V6                              # выбранные разделы
+make verify EXTRA='-e verify_rollout=true'          # плюс V11.6 (rolling restart core)
+make verify EXTRA='-e verify_writes=false'          # без проверок с записью (V5.4, V6.3, V8.2, V9)
 ```
 
-Требуются коллекции `kubernetes.core` (и опционально `community.docker`) и Python-модуль `kubernetes` на управляющей машине. Итог плейбука: сводная таблица «проверка — результат» и ненулевой код возврата при любом отказе, чтобы его можно было запускать по расписанию и в CI. В `backlog.md` это оформлено как H5.4.
+Устройство: `ansible/group_vars/all.yml` — единственное место чисел и адресов (число нод по ролям, `lb_ip`, namespace, закреплённые образы для V9); роль на раздел (`roles/verify_cluster` = V1, `verify_pods` = V2, `verify_infra_lb` = V3, `verify_consul` = V4, `verify_postgres` = V5, `verify_redis` = V6, `verify_haproxy` = V7, `verify_s3` = V8, `verify_reach` = V9, `verify_host` = V10, `verify_harbor` = V11, `verify_load` = V12); теги плея `V1`..`V12`. Модули: `kubernetes.core.k8s_info` (ноды, поды, сервисы, Secret, MetalLB), `k8s_exec` (consul, patronictl, valkey-cli, garage, HAProxy stats), `k8s` + `k8s_log` (Job для V9), `uri` (V3.3, V11.2, V11.3), `command` (docker, aws через `files/s3-access.sh`, `kubectl logs` для V12).
+
+Отличия от ручного ранбука:
+
+- V2.2 (рестарты) и V12.3 (соединения от обоих HAProxy) дают `WARN`, а не `FAIL`: рестарты остаются после тестов отказов (это история, не текущий сбой), а число адресов клиентов на primary зависит от того, сколько соединений открыто в данный момент. `INFO` (V2.3, V8.3, V10.1, V11.6 без флага) — только сведения.
+- V9 запускает Job на `app`-ноде (три контейнера-клиента); пароли копируются во временный Secret `verify-v9` в `default` (`no_log`) и удаляются в конце вместе с Job.
+- V8.2 требует `aws` CLI на хосте и использует изолированную конфигурацию (не читает `~/.aws`); при `verify_writes=false` не выполняется.
+- V11.3 проверяет демо-приложение; push/pull образов и OCI-чарта покрывает `hack/tests/h41-push-pull.sh`, а не плейбук. V12 не включает pull через registry (это тоже h41, где считаются запросы обеих реплик registry).
+- Поды в состоянии `Terminating` не считаются (проверка в момент rollout не даёт ложного отказа).
+- Пароли не попадают в вывод: задачи с ними `no_log: true`, а роль читает их из Secret'ов кластера.
+
+Проверено 2026-09-24 на живом стенде: 37 `PASS`, 0 `FAIL`, 6 `WARN`/`INFO`; отрицательные проверки: `-e expected_nodes=15` даёт `FAIL V1.1` и код возврата 2 (`make: *** Error 2`), а `kubectl scale deploy/harbor-portal --replicas=1` — `FAIL V11.1 bad: portal` (после возврата `2` проверка снова зелёная).

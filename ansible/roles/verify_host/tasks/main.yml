@@ -1,0 +1,25 @@
+# V10: host resources. Thresholds are advisory (WARN): the numbers are from measurements in backlog H5.3.
+- name: V10 | memory of the nodes, host memory, disk, inotify
+  ansible.builtin.shell: |
+    docker stats --no-stream --format '{% raw %}{{.MemUsage}}{% endraw %}' | awk '{v=$1; if (v ~ /GiB/) {sub("GiB","",v); s+=v*1024} else {sub("MiB","",v); s+=v}} END {printf "%.0f\n", s}'
+    free -m | awk 'NR==2 {print $7}'
+    df -BG --output=avail / | tail -1 | tr -dc 0-9; echo
+    sysctl -n fs.inotify.max_user_instances fs.inotify.max_user_watches
+  register: v10
+  changed_when: false
+  failed_when: false
+
+- name: V10 | record
+  vars:
+    v: "{{ v10.stdout_lines | default([]) }}"
+  ansible.builtin.set_fact:
+    verify_results: >-
+      {{ verify_results + [
+        {'id': 'V10.1', 't': 'memory used by the nodes (informational; ~4.5 GiB for the full stand)', 's': 'INFO',
+         'd': '%.1f GiB' | format((v[0] | default(0) | int) / 1024)},
+        {'id': 'V10.2', 't': 'host memory available >= 2 GiB', 's': 'PASS' if (v[1] | default(0) | int) >= 2048 else 'WARN', 'd': v[1] | default('?') ~ ' MiB'},
+        {'id': 'V10.3', 't': 'free disk space >= 20 GiB', 's': 'PASS' if (v[2] | default(0) | int) >= 20 else 'WARN', 'd': v[2] | default('?') ~ ' GiB'},
+        {'id': 'V10.4', 't': 'inotify limits >= 2048 / 1048576 (14 kind nodes)',
+         's': 'PASS' if ((v[3] | default(0) | int) >= 2048 and (v[4] | default(0) | int) >= 1048576) else 'FAIL',
+         'd': v[3] | default('?') ~ ' / ' ~ v[4] | default('?')}
+      ] }}

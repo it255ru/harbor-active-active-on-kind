@@ -2,7 +2,7 @@
 
 Repo: **harbor-active-active-on-kind**. Harbor in active-active (HA) mode on KinD: two replicas each of core/portal/registry/jobservice behind ingress, sharing external PostgreSQL (Patroni + Consul), Redis (Valkey + Sentinel) and S3 (Garage), on a 14-node cluster. It started on 2026-09-24 as a copy of `harbor-on-kind` @ `b65df71` (https://github.com/it255ru/harbor-on-kind, full history kept, not a GitHub fork).
 
-**Status:** Phases 0–4 are done and were re-verified on a stand rebuilt from scratch (milestone 1 accepted by the user on 2026-09-24; failure tests H4.1–H4.7 and the from-scratch acceptance H5.3 passed). Open: H5.4 (port `docs/verification-runbook.md` to Ansible), H5.5 (image cache for rebuilds, needs the user's decision). `backlog.md` (Russian) is the source of truth; see also `AGENTS.md` (layout, flow) and `README.md` (human runbook).
+**Status:** Phases 0–4 are done and were re-verified on a stand rebuilt from scratch (milestone 1 accepted by the user on 2026-09-24; failure tests H4.1–H4.7 and the from-scratch acceptance H5.3 passed). H5.4 is done (Ansible port of the runbook, `make verify`). Open: H5.5 (image cache for rebuilds, needs the user's decision). `backlog.md` (Russian) is the source of truth; see also `AGENTS.md` (layout, flow) and `README.md` (human runbook).
 
 ## Rules
 
@@ -48,6 +48,7 @@ make add-host        # "$LB_IP $HARBOR_HOST" into /etc/hosts (sudo)
 make harbor-ha       # hack/install-harbor-ha.sh: Secrets in `default` (once), then helm install with hack/config/harbor-ha.yaml + hack/helm-postrender.py; DRY_RUN=1 renders only
 make install         # infra-lb + harbor-ha
 make deploy-app      # project `python`, build/push demo image, CA trust on the control-plane node, pull secret, deploy (idempotent)
+make verify          # ansible/verify.yml: checks V1..V12 with a PASS/FAIL table, non-zero exit on FAIL (TAGS=V5,V6, EXTRA='-e verify_rollout=true'); needs pip `kubernetes` + collection kubernetes.core
 make cluster-ctx     # kubectl use-context kind-harbor
 make cluster-delete
 ```
@@ -72,6 +73,7 @@ Variables: `CLUSTER`, `KIND_IMAGE`, `KIND_VERSION`, `LB_IP`, `HARBOR_HOST`, `LOC
 - The chart has no `preStop`: `hack/helm-postrender.py` (PyYAML, used by `install-harbor-ha.sh`) adds `preStop: sleep 15` to core/registry/portal; without it rolling updates give 502s. Keep it when changing the install path.
 - 2 replicas on a 2-node role: `topologySpreadConstraints` (maxSkew 1) with `matchLabelKeys: [pod-template-hash]`, not a required `podAntiAffinity` (it deadlocks rolling updates). `harbor-lb` rolls with `maxSurge: 0`; HAProxy needs a `config-version` annotation bump to roll after a config change.
 - Every worker is tainted `harbor-ha/role=<role>:NoSchedule`: any new workload needs a `nodeSelector` and a toleration. The demo app runs on the control-plane node (the only place `deploy-app.sh` installs the CA).
+- `kubernetes.core.k8s_exec` splits `command` with shlex and runs no shell: use `sh -c "... $VAR ..."` (a `\$VAR` stays literal). Ansible checks (`ansible/`): each role appends to `verify_results`; skip `Terminating` pods (`deletionTimestamp`), they still report `Running`.
 - Kubernetes does not expand `$(HOSTNAME)` in `args`: use the downward API (`POD_NAME`).
 
 **Redis, HAProxy, S3**

@@ -122,7 +122,7 @@ The image blobs are in Garage, not on a volume: the only PVC of Harbor itself is
 
 ## Verify and test
 
-The runbook ([docs/verification-runbook.md](docs/verification-runbook.md)) has checks V1-V12 (state, placement, services, end-to-end, load distribution) with expected output and diagnostics. It is meant to be ported to Ansible later (backlog H5.4).
+The runbook ([docs/verification-runbook.md](docs/verification-runbook.md)) has checks V1-V12 (state, placement, services, end-to-end, load distribution) with expected output and diagnostics. `make verify` runs the same checks as an Ansible playbook (`ansible/`, about 1.5 minutes, table of `PASS`/`FAIL`/`WARN` and a non-zero exit code on any failure; `TAGS=V5,V6` for a subset). It needs the Python module `kubernetes` (`pip install --user kubernetes`) and the collection `kubernetes.core` (`ansible-galaxy collection install -r ansible/requirements.yml`).
 
 The failure tests are scripts in `hack/tests/`. They run real load, kill real nodes or pods and clean up after themselves; run one at a time, on a healthy stand, after the host load has settled (`cut -d' ' -f1 /proc/loadavg` below 3).
 

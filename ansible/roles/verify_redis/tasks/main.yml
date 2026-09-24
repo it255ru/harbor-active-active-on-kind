@@ -1,0 +1,79 @@
+# V6: Valkey + Sentinel. The password never leaves the pods: valkey-cli reads REDISCLI_AUTH from the container env.
+- name: V6 | roles, quorum, master
+  kubernetes.core.k8s_exec:
+    namespace: "{{ deps_ns }}"
+    pod: "{{ item.pod }}"
+    container: "{{ item.c }}"
+    command: "{{ item.cmd }}"
+  loop:
+    - {pod: redis-0, c: valkey, cmd: valkey-cli role}
+    - {pod: redis-1, c: valkey, cmd: valkey-cli role}
+    - {pod: redis-2, c: valkey, cmd: valkey-cli role}
+    - {pod: redis-0, c: sentinel, cmd: valkey-cli -p 26379 sentinel ckquorum mymaster}
+    - {pod: redis-0, c: sentinel, cmd: valkey-cli -p 26379 sentinel get-master-addr-by-name mymaster}
+    - {pod: redis-0, c: sentinel, cmd: valkey-cli -p 26379 sentinel master mymaster}
+  loop_control: {label: "{{ item.pod }} {{ item.cmd }}"}
+  register: v6
+  failed_when: false
+  changed_when: false
+
+- name: V6.3 | password required, write replicates
+  when: verify_writes | bool
+  block:
+    - name: V6.3 | ping without a password
+      kubernetes.core.k8s_exec:
+        namespace: "{{ deps_ns }}"
+        pod: redis-0
+        container: valkey
+        command: sh -c 'env -u REDISCLI_AUTH valkey-cli ping'
+      register: v63_noauth
+      failed_when: false
+      changed_when: false
+    - name: V6.3 | set through harbor-lb
+      kubernetes.core.k8s_exec:
+        namespace: "{{ deps_ns }}"
+        pod: redis-0
+        container: valkey
+        command: sh -c 'valkey-cli -h harbor-lb.{{ deps_ns }} set v63 ok'
+      register: v63_set
+      failed_when: false
+      changed_when: false
+    - name: V6.3 | read on another node
+      kubernetes.core.k8s_exec:
+        namespace: "{{ deps_ns }}"
+        pod: redis-2
+        container: valkey
+        command: sh -c 'for i in 1 2 3 4 5; do r=$(valkey-cli get v63); [ -n "$r" ] && break; sleep 1; done; echo "$r"'
+      register: v63_get
+      failed_when: false
+      changed_when: false
+  always:
+    - name: V6.3 | delete the key
+      kubernetes.core.k8s_exec:
+        namespace: "{{ deps_ns }}"
+        pod: redis-0
+        container: valkey
+        command: sh -c 'valkey-cli -h harbor-lb.{{ deps_ns }} del v63'
+      failed_when: false
+      changed_when: false
+
+- name: V6 | record
+  vars:
+    roles: "{{ v6.results[0:3] | map(attribute='stdout', default='') | map('split', '\n') | map('first') | list }}"
+    sentinel: "{{ v6.results[5].stdout | default('') | split('\n') | map('trim') | list }}"
+    master_info: "{{ dict(sentinel[0::2] | zip(sentinel[1::2])) if sentinel | length > 1 else {} }}"
+    master_addr: "{{ v6.results[4].stdout | default('') | split('\n') | first }}"
+  ansible.builtin.set_fact:
+    verify_results: >-
+      {{ verify_results + [
+        {'id': 'V6.1', 't': 'one master and two replicas', 's': 'PASS' if (roles | select('eq', 'master') | list | length == 1 and roles | select('eq', 'slave') | list | length == 2) else 'FAIL',
+         'd': roles | join(' ')},
+        {'id': 'V6.2', 't': 'Sentinel: quorum OK, master healthy with 2 replicas and 2 other sentinels',
+         's': 'PASS' if (v6.results[3].stdout | default('') is search('^OK 3 usable') and master_info.flags | default('') == 'master' and
+                         master_info['num-slaves'] | default('0') == '2' and master_info['num-other-sentinels'] | default('0') == '2' and
+                         master_info.quorum | default('0') == '2' and master_addr is search('^redis-[0-2]\.')) else 'FAIL',
+         'd': 'master %s flags %s slaves %s sentinels+1 %s' | format(master_addr, master_info.flags | default('?'), master_info['num-slaves'] | default('?'), master_info['num-other-sentinels'] | default('?'))},
+        {'id': 'V6.3', 't': 'password required (NOAUTH), write via harbor-lb replicates',
+         's': ('PASS' if (v63_noauth.stdout | default('') is search('NOAUTH') and v63_set.stdout | default('') | trim == 'OK' and v63_get.stdout | default('') | trim == 'ok') else 'FAIL') if verify_writes | bool else 'INFO',
+         'd': ('noauth: %s; set: %s; get: %s' | format(v63_noauth.stdout | default('') | trim, v63_set.stdout | default('') | trim, v63_get.stdout | default('') | trim)) if verify_writes | bool else 'skipped (verify_writes=false)'}
+      ] }}

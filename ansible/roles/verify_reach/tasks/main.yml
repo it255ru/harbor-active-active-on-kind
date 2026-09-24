@@ -1,0 +1,123 @@
+# V9: reachability of the dependencies from the namespace Harbor runs in. A Job on an app node with three containers
+# (PostgreSQL client, Valkey client); passwords are copied into a temporary Secret (no_log) that is removed at the end.
+- name: V9 | reachability Job
+  when: verify_writes | bool
+  vars:
+    job_name: verify-v9
+    placement:
+      nodeSelector: {harbor-ha/role: app}
+      tolerations: [{key: harbor-ha/role, operator: Equal, value: app, effect: NoSchedule}]
+  block:
+    - name: V9 | remove a leftover Job
+      kubernetes.core.k8s:
+        state: absent
+        api_version: batch/v1
+        kind: Job
+        name: "{{ job_name }}"
+        namespace: "{{ app_ns }}"
+        wait: true
+        delete_options: {propagationPolicy: Foreground}
+    - name: V9 | passwords of the dependencies
+      kubernetes.core.k8s_info: {kind: Secret, namespace: "{{ deps_ns }}", name: "{{ item }}"}
+      loop: [pg-credentials, redis-credentials]
+      register: v9_secrets
+      no_log: true
+    - name: V9 | temporary Secret in the Harbor namespace (removed at the end)
+      kubernetes.core.k8s:
+        state: present
+        definition:
+          apiVersion: v1
+          kind: Secret
+          metadata: {name: "{{ job_name }}", namespace: "{{ app_ns }}"}
+          data:
+            pg: "{{ v9_secrets.results[0].resources[0].data.harbor }}"
+            redis: "{{ v9_secrets.results[1].resources[0].data.password }}"
+      no_log: true
+    - name: V9 | run the Job
+      kubernetes.core.k8s:
+        state: present
+        wait: true
+        wait_timeout: 240
+        wait_condition: {type: Complete, status: "True"}
+        definition:
+          apiVersion: batch/v1
+          kind: Job
+          metadata: {name: "{{ job_name }}", namespace: "{{ app_ns }}"}
+          spec:
+            backoffLimit: 0
+            ttlSecondsAfterFinished: 600
+            template:
+              spec:
+                restartPolicy: Never
+                nodeSelector: "{{ placement.nodeSelector }}"
+                tolerations: "{{ placement.tolerations }}"
+                containers:
+                  - name: pg
+                    image: "{{ image_pg }}"
+                    env:
+                      - name: PGPASSWORD
+                        valueFrom: {secretKeyRef: {name: "{{ job_name }}", key: pg}}
+                    command:
+                      - sh
+                      - -c
+                      - |
+                        echo "V9.1 $(psql "host=harbor-lb.{{ deps_ns }} port=5432 user=harbor dbname=registry connect_timeout=5" -Atc 'select not pg_is_in_recovery()')"
+                        echo "V9.2 $(wget -qO- http://consul.{{ deps_ns }}:8500/v1/status/leader)"
+                        nc -z -w3 s3.{{ deps_ns }}.svc.cluster.local 3900 && echo "V9.4 s3-port-open"
+                  - name: valkey
+                    image: "{{ image_valkey }}"
+                    env:
+                      - name: REDISCLI_AUTH
+                        valueFrom: {secretKeyRef: {name: "{{ job_name }}", key: redis}}
+                    command:
+                      - sh
+                      - -c
+                      - |
+                        h=harbor-lb.{{ deps_ns }}
+                        echo "V9.3 $(valkey-cli -h $h set v93 ok) $(valkey-cli -h $h get v93) $(valkey-cli -h $h del v93)"
+      register: v9_job
+      failed_when: false
+    - name: V9 | logs of the containers
+      kubernetes.core.k8s_log:
+        api_version: batch/v1
+        kind: Job
+        name: "{{ job_name }}"
+        namespace: "{{ app_ns }}"
+        container: "{{ item }}"
+      loop: [pg, valkey]
+      register: v9_logs
+      failed_when: false
+  always:
+    - name: V9 | remove the temporary Secret
+      kubernetes.core.k8s:
+        state: absent
+        api_version: v1
+        kind: Secret
+        name: "{{ job_name }}"
+        namespace: "{{ app_ns }}"
+      failed_when: false
+    - name: V9 | remove the Job
+      kubernetes.core.k8s:
+        state: absent
+        api_version: batch/v1
+        kind: Job
+        name: "{{ job_name }}"
+        namespace: "{{ app_ns }}"
+        wait: true
+        delete_options: {propagationPolicy: Foreground}
+      failed_when: false
+
+- name: V9 | record
+  vars:
+    text: "{{ v9_logs.results | default([]) | map(attribute='log', default='') | join('\n') }}"
+    skipped: "{{ not (verify_writes | bool) }}"
+    st: "{{ 'INFO' if skipped else 'FAIL' }}"
+  ansible.builtin.set_fact:
+    verify_results: >-
+      {{ verify_results + [
+        {'id': 'V9.1', 't': 'PostgreSQL through harbor-lb from the Harbor namespace reaches the primary',
+         's': 'PASS' if text is search('V9.1 t') else st, 'd': 'skipped (verify_writes=false)' if skipped else ''},
+        {'id': 'V9.2', 't': 'Consul API answers with a leader', 's': 'PASS' if text is search('V9.2 "[0-9.]+:8300"') else st, 'd': ''},
+        {'id': 'V9.3', 't': 'Redis through harbor-lb: set/get/del', 's': 'PASS' if text is search('V9.3 OK ok 1') else st, 'd': ''},
+        {'id': 'V9.4', 't': 'S3 port open from the Harbor namespace', 's': 'PASS' if text is search('V9.4 s3-port-open') else st, 'd': ''}
+      ] }}

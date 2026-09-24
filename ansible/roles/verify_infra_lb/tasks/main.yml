@@ -1,0 +1,63 @@
+# V3: Infra LB = ingress-nginx x2 + MetalLB.
+- name: V3 | gather
+  kubernetes.core.k8s_info: {kind: Pod, namespace: "{{ app_ns }}"}
+  register: v3_pods
+- name: V3 | ingress service
+  kubernetes.core.k8s_info: {kind: Service, namespace: "{{ app_ns }}", name: ingress-nginx-controller}
+  register: v3_svc
+- name: V3 | MetalLB pool and advertisement
+  kubernetes.core.k8s_info: {api_version: metallb.io/v1beta1, kind: "{{ item }}"}
+  loop: [IPAddressPool, L2Advertisement]
+  register: v3_metallb
+  failed_when: false
+- name: V3 | docker network
+  ansible.builtin.command: docker network inspect -f '{% raw %}{{range .IPAM.Config}}{{.Subnet}} {{end}}{% endraw %}' kind
+  register: v3_net
+  changed_when: false
+  failed_when: false
+- name: V3 | HTTP and HTTPS on the LB address
+  ansible.builtin.uri:
+    url: "{{ item }}://{{ lb_ip }}/"
+    validate_certs: false
+    timeout: 5
+    status_code: [-1, 200, 404, 502, 503]
+  loop: [http, https]
+  register: v3_http
+  failed_when: false
+
+- name: V3 | record
+  vars:
+    ingress: >-
+      {{ v3_pods.resources | selectattr('metadata.name', 'match', '^ingress-nginx-controller') |
+         selectattr('status.phase', 'eq', 'Running') | rejectattr('metadata.deletionTimestamp', 'defined') | list }}
+    ingress_nodes: "{{ ingress | map(attribute='spec.nodeName') | list }}"
+    ingress_roles: "{{ ingress_nodes | map('extract', role_of) | list }}"
+    lb_addr: "{{ (v3_svc.resources | first | default({})).status.loadBalancer.ingress | default([{}]) | first | default({}) }}"
+    names: "{{ v3_pods.resources | map(attribute='metadata.name') | list }}"
+    count: "{{ ['metallb-controller', 'metallb-speaker', 'metallb-frr-k8s-[a-z0-9]{5}$', 'metallb-frr-k8s-statuscleaner'] }}"
+    pool: "{{ v3_metallb.results[0].resources | default([]) | map(attribute='spec.addresses') | flatten }}"
+    l2: "{{ v3_metallb.results[1].resources | default([]) | length }}"
+    metallb_running: >-
+      {{ v3_pods.resources | selectattr('metadata.name', 'match', '^metallb') |
+         rejectattr('status.phase', 'eq', 'Running') | list | length == 0 }}
+    n_speaker: "{{ names | select('match', '^metallb-speaker') | list | length }}"
+    n_frr: "{{ names | select('match', '^metallb-frr-k8s-[a-z0-9]{5}$') | list | length }}"
+    codes: "{{ v3_http.results | map(attribute='status') | list }}"
+  ansible.builtin.set_fact:
+    verify_results: >-
+      {{ verify_results + [
+        {'id': 'V3.1', 't': 'two ingress-nginx pods on different lb nodes',
+         's': 'PASS' if (ingress | length == 2 and ingress_nodes | unique | length == 2 and ingress_roles | unique == ['lb']) else 'FAIL',
+         'd': ingress_nodes | join(', ')},
+        {'id': 'V3.2', 't': 'LB address ' ~ lb_ip ~ ' and kind subnet ' ~ kind_subnet,
+         's': 'PASS' if (lb_addr.ip | default('') == lb_ip and kind_subnet in v3_net.stdout | default('')) else 'FAIL',
+         'd': 'service ' ~ lb_addr.ip | default('none') ~ ', network ' ~ (v3_net.stdout | default('?') | trim)},
+        {'id': 'V3.3', 't': 'LB answers from the host (404 = default backend)',
+         's': 'PASS' if codes == [404, 404] else 'FAIL', 'd': 'http/https ' ~ codes | join('/')},
+        {'id': 'V3.4', 't': 'MetalLB: controller, 2 speaker, 2 frr-k8s, statuscleaner, pool, L2 advertisement',
+         's': 'PASS' if (metallb_running | bool and n_speaker | int == 2 and n_frr | int == 2 and
+                         names | select('match', '^metallb-controller') | list | length == 1 and
+                         names | select('match', '^metallb-frr-k8s-statuscleaner') | list | length == 1 and
+                         lb_pool in pool and l2 | int >= 1) else 'FAIL',
+         'd': 'speaker %s, frr %s, pool %s, l2adv %s' | format(n_speaker, n_frr, pool | join(','), l2)}
+      ] }}

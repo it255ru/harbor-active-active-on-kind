@@ -1,0 +1,45 @@
+# V8: Garage. The image has no shell: /garage is called directly.
+- name: V8 | Garage pod
+  kubernetes.core.k8s_info: {kind: Pod, namespace: "{{ deps_ns }}", name: garage-0}
+  register: v8_pod
+
+- name: V8 | garage status, bucket, key
+  kubernetes.core.k8s_exec:
+    namespace: "{{ deps_ns }}"
+    pod: garage-0
+    command: "{{ item }}"
+  loop:
+    - /garage status
+    - /garage bucket info registry-blobs
+    - /garage key info harbor
+  register: v8
+  failed_when: false
+  changed_when: false
+
+- name: V8.2 | S3 API with the Harbor key (aws CLI on the host)
+  ansible.builtin.command: "{{ role_path }}/../../files/s3-access.sh {{ kube_context }} {{ deps_ns }}"
+  when: verify_writes | bool
+  register: v82
+  changed_when: false
+  failed_when: false
+
+- name: V8 | record
+  vars:
+    pod: "{{ v8_pod.resources | first | default({}) }}"
+    bucket: "{{ v8.results[1].stdout | default('') }}"
+    key: "{{ v8.results[2].stdout | default('') }}"
+    unfinished: "{{ bucket | regex_search('Unfinished uploads[^\n]*') | default('') }}"
+    size: "{{ bucket | regex_search('Size:[^\n]*') | default('') }}"
+    objects: "{{ bucket | regex_search('Objects:[^\n]*') | default('') }}"
+  ansible.builtin.set_fact:
+    verify_results: >-
+      {{ verify_results + [
+        {'id': 'V8.1', 't': 'garage-0 on the s3 node, layout applied (dc1), bucket registry-blobs, key harbor',
+         's': 'PASS' if (pod.status.phase | default('') == 'Running' and role_of[pod.spec.nodeName | default('')] | default('') == 's3' and
+                         v8.results[0].stdout | default('') is search('dc1') and bucket is search('registry-blobs') and key is search('registry-blobs')) else 'FAIL',
+         'd': 'node ' ~ pod.spec.nodeName | default('none') ~ '; ' ~ size ~ '; ' ~ objects},
+        {'id': 'V8.2', 't': 'Harbor key: read/write in registry-blobs, other bucket denied',
+         's': ('PASS' if v82.stdout | default('') | trim == 'rw=ok other=denied' else 'FAIL') if verify_writes | bool else 'INFO',
+         'd': v82.stdout | default('skipped (verify_writes=false)') | trim ~ (' ' ~ (v82.stderr | default('') | trim | truncate(80)) if v82.rc | default(0) != 0 else '')},
+        {'id': 'V8.3', 't': 'unfinished multipart uploads (informational)', 's': 'INFO', 'd': unfinished | trim}
+      ] }}

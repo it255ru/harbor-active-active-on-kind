@@ -1,0 +1,100 @@
+# V5: PostgreSQL under Patroni. V5.3/V5.4 use the harbor password from Secret pg-credentials (no_log).
+- name: V5 | Patroni cluster and REST checks
+  kubernetes.core.k8s_exec:
+    namespace: "{{ deps_ns }}"
+    pod: pg-0
+    command: "{{ item }}"
+  loop:
+    - patronictl -c /etc/patroni/patroni.yml list -f json
+    - curl -s -o /dev/null -w %{http_code} http://pg-0.pg-headless:8008/primary
+    - curl -s -o /dev/null -w %{http_code} http://pg-1.pg-headless:8008/primary
+    - curl -s -o /dev/null -w %{http_code} http://pg-1.pg-headless:8008/replica
+    - curl -s -o /dev/null -w %{http_code} http://pg-0.pg-headless:8008/replica
+  register: v5
+  failed_when: false
+  changed_when: false
+
+- name: V5 | harbor password
+  kubernetes.core.k8s_info: {kind: Secret, namespace: "{{ deps_ns }}", name: pg-credentials}
+  register: v5_secret
+  no_log: true
+
+- name: V5 | current leader
+  ansible.builtin.set_fact:
+    v5_leader: "{{ (v5.results[0].stdout | default('[]') | from_json | selectattr('Role', 'eq', 'Leader') | map(attribute='Member') | list | first) | default('') }}"
+
+- name: V5.3 | login through harbor-lb lands on the primary
+  kubernetes.core.k8s_exec:
+    namespace: "{{ deps_ns }}"
+    pod: pg-1
+    command: >-
+      psql "postgresql://harbor:{{ v5_secret.resources[0].data.harbor | b64decode }}@harbor-lb.{{ deps_ns }}:5432/registry"
+      -Atc "select 'in_recovery=' || pg_is_in_recovery()"
+  register: v5_via_lb
+  failed_when: false
+  changed_when: false
+  no_log: true
+
+- name: V5.4 | write on the leader, read on the replica
+  when: verify_writes | bool and v5_leader != ''
+  vars:
+    replica: "{{ 'pg-1' if v5_leader == 'pg-0' else 'pg-0' }}"
+    pw: "{{ v5_secret.resources[0].data.harbor | b64decode }}"
+  block:
+    - name: V5.4 | create and insert on the leader
+      kubernetes.core.k8s_exec:
+        namespace: "{{ deps_ns }}"
+        pod: "{{ v5_leader }}"
+        command: >-
+          psql "postgresql://harbor:{{ pw }}@{{ v5_leader }}.pg-headless:5432/registry" -Atc
+          "drop table if exists v54_probe; create table v54_probe(i int); insert into v54_probe values (42)"
+      failed_when: false
+      changed_when: false
+      no_log: true
+    - name: V5.4 | wait for replication and read on the replica
+      kubernetes.core.k8s_exec:
+        namespace: "{{ deps_ns }}"
+        pod: "{{ replica }}"
+        command: >-
+          sh -c 'for i in 1 2 3 4 5 6 7 8 9 10; do
+          r=$(psql "postgresql://harbor:{{ pw }}@{{ replica }}.pg-headless:5432/registry" -Atc "select pg_is_in_recovery(), i from v54_probe" 2>/dev/null);
+          [ -n "$r" ] && break; sleep 1; done; echo "$r"'
+      register: v5_repl
+      failed_when: false
+      changed_when: false
+      no_log: true
+  always:
+    - name: V5.4 | drop the probe table
+      kubernetes.core.k8s_exec:
+        namespace: "{{ deps_ns }}"
+        pod: "{{ v5_leader }}"
+        command: >-
+          psql "postgresql://harbor:{{ pw }}@{{ v5_leader }}.pg-headless:5432/registry" -Atc "drop table if exists v54_probe"
+      failed_when: false
+      changed_when: false
+      no_log: true
+
+- name: V5 | record
+  vars:
+    members: "{{ v5.results[0].stdout | default('[]') | from_json }}"
+    leaders: "{{ members | selectattr('Role', 'eq', 'Leader') | selectattr('State', 'eq', 'running') | list }}"
+    replicas: "{{ members | selectattr('Role', 'eq', 'Replica') | selectattr('State', 'eq', 'streaming') | list }}"
+    lag: "{{ replicas | map(attribute='Replay Lag', default=0) | list }}"
+    codes: "{{ v5.results[1:] | map(attribute='stdout', default='') | list }}"
+    # order of the loop: pg-0/primary, pg-1/primary, pg-1/replica, pg-0/replica
+    want: "{{ ['200', '503', '200', '503'] if v5_leader == 'pg-0' else ['503', '200', '503', '200'] }}"
+  ansible.builtin.set_fact:
+    verify_results: >-
+      {{ verify_results + [
+        {'id': 'V5.1', 't': 'Patroni: one running Leader, one streaming Replica, lag 0',
+         's': 'PASS' if (leaders | length == 1 and replicas | length == 1 and lag | select('ne', 0) | list | length == 0) else 'FAIL',
+         'd': members | map(attribute='Member') | zip(members | map(attribute='Role'), members | map(attribute='State')) | map('join', ':') | join(' ')},
+        {'id': 'V5.2', 't': 'Patroni REST: /primary 200 on the leader only, /replica 200 on the replica only',
+         's': 'PASS' if codes == want else 'FAIL', 'd': 'primary pg-0/pg-1 + replica pg-1/pg-0: ' ~ codes | join('/') ~ ', expected ' ~ want | join('/')},
+        {'id': 'V5.3', 't': 'harbor login through harbor-lb reaches the primary (from the replica pod)',
+         's': 'PASS' if v5_via_lb.stdout | default('') | trim == 'in_recovery=false' else 'FAIL',
+         'd': v5_via_lb.stdout | default('no answer') | trim},
+        {'id': 'V5.4', 't': 'write on the leader is visible on the replica (replica in recovery)',
+         's': ('PASS' if v5_repl.stdout | default('') | trim == 't|42' else 'FAIL') if (verify_writes | bool and v5_leader != '') else 'INFO',
+         'd': (v5_repl.stdout | default('skipped') | trim) if (verify_writes | bool) else 'skipped (verify_writes=false)'}
+      ] }}

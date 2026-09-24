@@ -1,0 +1,128 @@
+# V11: Harbor itself (after make harbor-ha and make deploy-app). docker login / push / pull are covered by
+# hack/tests/h41-push-pull.sh; here the API, the placement and where the data lives.
+- name: V11 | Harbor pods and PVCs
+  kubernetes.core.k8s_info: {kind: "{{ item }}", namespace: "{{ app_ns }}"}
+  loop: [Pod, PersistentVolumeClaim]
+  register: v11_raw
+
+- name: V11.2 | UI, registry endpoint, API login
+  ansible.builtin.uri:
+    url: "https://{{ harbor_host }}{{ item.path }}"
+    validate_certs: false
+    timeout: 10
+    status_code: [-1, 200, 401, 404, 500, 502, 503]
+    url_username: "{{ item.auth | default(omit) }}"
+    url_password: "{{ harbor_admin_password if item.auth is defined else omit }}"
+    force_basic_auth: "{{ item.auth is defined }}"
+  loop:
+    - {path: /}
+    - {path: /v2/}
+    - {path: /api/v2.0/users/current, auth: "{{ harbor_admin_user }}"}
+  loop_control: {label: "{{ item.path }}"}
+  register: v112
+  failed_when: false
+  no_log: true
+
+- name: V11.3 | demo app answers on its LoadBalancer address
+  ansible.builtin.uri:
+    url: "http://{{ demo_ip }}:5000/"
+    return_content: true
+    timeout: 5
+    status_code: [-1, 200]
+  register: v113
+  failed_when: false
+
+- name: V11.4/5 | S3 objects, projects in PostgreSQL, keys in Redis
+  block:
+    - name: V11.4 | bucket info
+      kubernetes.core.k8s_exec:
+        namespace: "{{ deps_ns }}"
+        pod: garage-0
+        command: /garage bucket info registry-blobs
+      register: v114
+      failed_when: false
+      changed_when: false
+    - name: V11.5 | secret, sentinel master
+      kubernetes.core.k8s_info: {kind: Secret, namespace: "{{ deps_ns }}", name: pg-credentials}
+      register: v115_secret
+      no_log: true
+    - name: V11.5 | projects through harbor-lb
+      kubernetes.core.k8s_exec:
+        namespace: "{{ deps_ns }}"
+        pod: pg-0
+        command: >-
+          psql "postgresql://harbor:{{ v115_secret.resources[0].data.harbor | b64decode }}@harbor-lb.{{ deps_ns }}:5432/registry"
+          -Atc "select count(*) from project"
+      register: v115_pg
+      failed_when: false
+      changed_when: false
+      no_log: true
+    - name: V11.5 | Redis master
+      kubernetes.core.k8s_exec:
+        namespace: "{{ deps_ns }}"
+        pod: redis-0
+        container: sentinel
+        command: valkey-cli -p 26379 sentinel get-master-addr-by-name mymaster
+      register: v115_master
+      failed_when: false
+      changed_when: false
+    - name: V11.5 | keys in the Redis master
+      kubernetes.core.k8s_exec:
+        namespace: "{{ deps_ns }}"
+        pod: "{{ v115_master.stdout | default('') | split('\n') | first | split('.') | first }}"
+        container: valkey
+        command: valkey-cli -n 0 dbsize
+      register: v115_redis
+      failed_when: false
+      changed_when: false
+
+- name: V11.6 | rolling update of harbor-core (only with verify_rollout=true)
+  when: verify_rollout | bool
+  ansible.builtin.shell: >-
+    kubectl --context {{ kube_context }} rollout restart deploy/harbor-core &&
+    kubectl --context {{ kube_context }} rollout status deploy/harbor-core --timeout=180s
+  register: v116
+  changed_when: true
+  failed_when: false
+
+- name: V11 | record
+  vars:
+    pods: "{{ v11_raw.results[0].resources | selectattr('status.phase', 'eq', 'Running') | rejectattr('metadata.deletionTimestamp', 'defined') | list }}"
+    pvcs: "{{ v11_raw.results[1].resources | map(attribute='metadata.name') | list }}"
+    per_component: >-
+      {%- set out = {} -%}
+      {%- for p in pods if p.metadata.labels.get('app') == 'harbor' and p.metadata.labels.get('component') in ['core', 'portal', 'registry', 'jobservice'] -%}
+      {%- set c = p.metadata.labels.component -%}
+      {%- set _ = out.update({c: out.get(c, []) + [p.spec.nodeName]}) -%}
+      {%- endfor -%}
+      {{ out }}
+    bad_components: >-
+      {%- set out = [] -%}
+      {%- for c in ['core', 'portal', 'registry', 'jobservice'] -%}
+      {%- set n = per_component.get(c, []) -%}
+      {%- if n | length != 2 or n | unique | length != 2 or (n | map('extract', role_of) | unique | list) != ['app'] -%}{%- set _ = out.append(c) -%}{%- endif -%}
+      {%- endfor -%}
+      {{ out }}
+    internal: >-
+      {{ v11_raw.results[0].resources | map(attribute='metadata.name') | select('match', '^harbor-(database|redis)') | list }}
+    codes: "{{ v112.results | map(attribute='status') | list }}"
+    objects: "{{ (v114.stdout | default('') | regex_search('Objects: +([0-9]+)', '\\1') | default([0], true)) | first | int }}"
+    projects: "{{ v115_pg.stdout | default('0') | trim | int }}"
+    dbsize: "{{ v115_redis.stdout | default('0') | trim | int }}"
+  ansible.builtin.set_fact:
+    verify_results: >-
+      {{ verify_results + [
+        {'id': 'V11.1', 't': 'core/portal/registry/jobservice: 1+1 on the two app nodes, no bundled database/redis',
+         's': 'PASS' if (bad_components | length == 0 and internal | length == 0) else 'FAIL',
+         'd': (('bad: ' ~ bad_components | join(',') ~ '; ') if bad_components else '') ~ (('internal: ' ~ internal | join(',')) if internal else (per_component | length ~ ' components x 2 pods') if not bad_components else '')},
+        {'id': 'V11.2', 't': 'UI 200, /v2/ 401, API login 200', 's': 'PASS' if codes == [200, 401, 200] else 'FAIL', 'd': codes | join('/')},
+        {'id': 'V11.3', 't': 'demo app (hello) answers on ' ~ demo_ip, 's': 'PASS' if v113.content | default('') is search('^Hello, Kube!') else 'FAIL',
+         'd': v113.content | default('no answer') | trim},
+        {'id': 'V11.4', 't': 'blobs in S3 (objects > 0), only the trivy PVC in the namespace',
+         's': 'PASS' if (objects | int > 0 and pvcs == ['data-harbor-trivy-0']) else 'FAIL', 'd': '%s objects; PVCs %s' | format(objects, pvcs | join(','))},
+        {'id': 'V11.5', 't': 'Harbor data in external PostgreSQL (projects >= 1) and Redis (keys > 0)',
+         's': 'PASS' if (projects | int >= 1 and dbsize | int > 0) else 'FAIL', 'd': '%s projects, %s keys on the master' | format(projects, dbsize)},
+        {'id': 'V11.6', 't': 'rolling update of harbor-core completes',
+         's': ('PASS' if v116.rc | default(1) == 0 else 'FAIL') if verify_rollout | bool else 'INFO',
+         'd': (v116.stdout_lines | default(['']) | last) if verify_rollout | bool else 'skipped (verify_rollout=false)'}
+      ] }}

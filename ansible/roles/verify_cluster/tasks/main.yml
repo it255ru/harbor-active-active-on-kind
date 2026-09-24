@@ -1,0 +1,31 @@
+# V1: cluster, roles, taints. Uses all_nodes/role_of from the pre_tasks.
+- name: V1 | nodes per role
+  kubernetes.core.k8s_info:
+    kind: Node
+    label_selectors: ["harbor-ha/role={{ item.key }}"]
+  loop: "{{ expected_roles | dict2items }}"
+  loop_control: {label: "{{ item.key }}"}
+  register: v1_by_role
+
+- name: V1 | record
+  vars:
+    ready: >-
+      {{ all_nodes.resources | map(attribute='status.conditions') | map('selectattr', 'type', 'eq', 'Ready') |
+         map('selectattr', 'status', 'eq', 'True') | map('list') | select | list | length }}
+    actual: "{{ dict(v1_by_role.results | map(attribute='item.key') | zip(v1_by_role.results | map(attribute='resources') | map('length'))) }}"
+    tainted: >-
+      {{ all_nodes.resources | selectattr('spec.taints', 'defined') | map(attribute='spec.taints') |
+         map('selectattr', 'key', 'eq', 'harbor-ha/role') | map('list') | select | list | length }}
+  ansible.builtin.set_fact:
+    verify_results: >-
+      {{ verify_results + [
+        {'id': 'V1.1', 't': 'all nodes Ready',
+         's': 'PASS' if (ready | int == all_nodes.resources | length and all_nodes.resources | length == expected_nodes) else 'FAIL',
+         'd': '%s of %s Ready, expected %s' | format(ready, all_nodes.resources | length, expected_nodes)},
+        {'id': 'V1.2', 't': 'node roles as in kind-cluster.yaml',
+         's': 'PASS' if actual == expected_roles else 'FAIL',
+         'd': 'actual %s, expected %s' | format(actual, expected_roles)},
+        {'id': 'V1.3', 't': 'role taints on the workers',
+         's': 'PASS' if tainted | int == expected_tainted_nodes else 'FAIL',
+         'd': '%s tainted, expected %s' | format(tainted, expected_tainted_nodes)}
+      ] }}

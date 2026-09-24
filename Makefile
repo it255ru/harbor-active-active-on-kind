@@ -121,3 +121,9 @@ s3: ## Install Garage (S3 stand-in for Ceph RGW) on the s3 node, bucket registry
 .PHONY: deploy-app
 deploy-app: ## Build, push, and deploy the demo app (run after `install`).
 	@CLUSTER=$(CLUSTER) HARBOR_HOST=$(HARBOR_HOST) LB_IP=$(LB_IP) ./hack/deploy-app.sh
+
+##@ Verification
+
+.PHONY: verify
+verify: ## Run the Ansible checks V1..V12 (TAGS=V5,V6 for a subset, EXTRA='-e verify_rollout=true'); needs ansible + kubernetes.core.
+	@./ansible/run.sh $(if $(TAGS),--tags $(TAGS)) $(EXTRA)

@@ -1,0 +1,50 @@
+# V7: Harbor LB (HAProxy): two pods on different lb nodes, exactly one UP backend per PG and Redis on each.
+- name: V7 | harbor-lb pods
+  kubernetes.core.k8s_info: {kind: Pod, namespace: "{{ deps_ns }}", label_selectors: [app=harbor-lb]}
+  register: v7_pods
+
+- name: V7 | HAProxy stats of every pod
+  kubernetes.core.k8s_exec:
+    namespace: "{{ deps_ns }}"
+    pod: "{{ item.metadata.name }}"
+    command: wget -qO- 'http://127.0.0.1:8404/stats;csv'
+  loop: "{{ v7_pods.resources }}"
+  loop_control: {label: "{{ item.metadata.name }}"}
+  register: v7_stats
+  failed_when: false
+  changed_when: false
+
+- name: V7 | record
+  vars:
+    pods: "{{ v7_pods.resources | selectattr('status.phase', 'eq', 'Running') | rejectattr('metadata.deletionTimestamp', 'defined') | list }}"
+    nodes: "{{ pods | map(attribute='spec.nodeName') | list }}"
+    per_pod: >-
+      {%- set out = [] -%}
+      {%- for r in v7_stats.results -%}
+      {%- set c = {'pod': r.item.metadata.name, 'postgres_up': [], 'postgres_n': 0, 'redis_up': [], 'redis_n': 0} -%}
+      {%- for line in r.stdout | default('') | split('\n') -%}
+      {%- set f = line.split(',') -%}
+      {%- if f | length > 17 and f[0] in ['postgres', 'redis'] and f[1] not in ['BACKEND', 'FRONTEND'] -%}
+      {%- set _ = c.update({f[0] ~ '_n': c[f[0] ~ '_n'] + 1}) -%}
+      {%- if f[17] == 'UP' -%}{%- set _ = c[f[0] ~ '_up'].append(f[1]) -%}{%- endif -%}
+      {%- endif -%}
+      {%- endfor -%}
+      {%- set _ = out.append(c) -%}
+      {%- endfor -%}
+      {{ out }}
+    summary: >-
+      {%- set out = [] -%}
+      {%- for c in per_pod -%}{%- set _ = out.append(c.postgres_up | join(',') ~ ' + ' ~ c.redis_up | join(',')) -%}{%- endfor -%}
+      {{ out | join('; ') }}
+  ansible.builtin.set_fact:
+    verify_results: >-
+      {{ verify_results + [
+        {'id': 'V7.1', 't': 'two harbor-lb pods Running on different lb nodes',
+         's': 'PASS' if (pods | length == 2 and nodes | unique | length == 2 and nodes | map('extract', role_of) | unique | list == ['lb']) else 'FAIL',
+         'd': nodes | join(', ')},
+        {'id': 'V7.2', 't': 'HAProxy: exactly one UP backend for PG (of 2) and Redis (of 3) on every pod',
+         's': 'PASS' if (per_pod | length == 2 and per_pod | selectattr('postgres_n', 'eq', 2) | selectattr('redis_n', 'eq', 3) |
+                         map(attribute='postgres_up') | map('length') | select('eq', 1) | list | length == 2 and
+                         per_pod | map(attribute='redis_up') | map('length') | select('eq', 1) | list | length == 2) else 'FAIL',
+         'd': 'UP (pg + redis) per pod: ' ~ summary}
+      ] }}
