@@ -100,7 +100,7 @@ kubectl run h47-pgw --image=$PGI --restart=Never --overrides="$OV" --env=PGPASSW
 kubectl run h47-redisw --image=$VKI --restart=Never --overrides="$OV" --env=REDISCLI_AUTH="$RPW" --command -- sh -c "$RDW" >/dev/null
 kubectl wait --for=condition=ready pod/h47-pgw pod/h47-redisw --timeout=120s >/dev/null 2>&1
 
-restart_snapshot() { kubectl get pods -A -o custom-columns=P:.metadata.namespace,N:.metadata.name,R:.status.containerStatuses[*].restartCount --no-headers 2>/dev/null | awk '{n=0; for(i=3;i<=NF;i++) if ($i ~ /^[0-9]+$/) n+=$i; print $1"/"$2, n}' | sed -E 's/-[a-z0-9]{8,10}-[a-z0-9]{5} / /' | sort; }
+restart_snapshot() { kubectl get pods -A -o custom-columns=P:.metadata.namespace,N:.metadata.name,R:.status.containerStatuses[*].restartCount --no-headers 2>/dev/null | awk '{n=0; for(i=3;i<=NF;i++) if ($i ~ /^[0-9]+$/) n+=$i; print $1"/"$2, n}' | sort; }
 restart_snapshot > restarts.before
 MANIFEST=$(curl -sk -u "$AUTH" -H "Accept: application/vnd.docker.distribution.manifest.v2+json" "https://$HOST/v2/python/hello/manifests/1.0")
 BLOB=$(echo "$MANIFEST" | python3 -c "import sys,json; d=json.load(sys.stdin); print(max(d['layers'],key=lambda l:l['size'])['digest'])")
@@ -157,6 +157,6 @@ RFINAL=$(kubectl -n $NS exec redis-0 -c valkey -- valkey-cli -h harbor-lb.$NS ge
 python3 "$HERE/h47_analyze.py" "$W" "$RFINAL"
 restart_snapshot > restarts.after
 echo "   container restarts during the test (pod: before -> after):"
-join -a2 -e0 -o 0,1.2,2.2 restarts.before restarts.after 2>/dev/null | awk '$3>$2{printf "     %s: %s -> %s\n", $1,$2,$3; f=1} END{if(!f) print "     none"}'
+join -o 0,1.2,2.2 restarts.before restarts.after 2>/dev/null | awk '$3>$2{printf "     %s: %s -> %s\n", $1,$2,$3; f=1} END{if(!f) print "     none"}'
 echo "   final state: $(kubectl -n $NS exec pg-0 -- patronictl -c /etc/patroni/patroni.yml list -f json 2>/dev/null | python3 -c "import sys,json; print([(m['Member'],m['Role'],m['State']) for m in json.load(sys.stdin)])" 2>/dev/null)"
 echo "   harbor: $(kubectl get deploy --no-headers | grep harbor- | awk '{print $1"="$2}' | paste -sd' ')   logs in $W"

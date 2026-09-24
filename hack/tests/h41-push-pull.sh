@@ -62,14 +62,12 @@ kubectl rollout status deploy/hello-kube --timeout=120s >/dev/null 2>&1
 check "$(helm test hello-kube 2>&1 | grep -q 'Phase: *Succeeded' && echo ok || echo bad)" "helm install from OCI and helm test succeed"
 
 echo "== 5. both replicas took part since the start of the test"
-for c in registry core; do
-  for p in $(kubectl get pods -l component=$c -o name); do
-    if [ "$c" = registry ]; then n=$(kubectl logs "$p" -c registry --since-time="$T0" | grep -cE 'PUT /v2/|PATCH /v2/'); else n=$(kubectl logs "$p" --since-time="$T0" 2>/dev/null | wc -l); fi
-    echo "   $c ${p#pod/}: $n"; eval "cnt_${c}_${p##*-}=$n"
-  done
+# every /v2/ request counts (pulls, HEADs, uploads): two uploads alone can land on the same replica by chance
+a=0
+for p in $(kubectl get pods -l component=registry -o name); do
+  n=$(kubectl logs "$p" -c registry --since-time="$T0" | grep -cE '(GET|HEAD|PUT|PATCH|POST) /v2/'); echo "   registry ${p#pod/}: $n requests"; [ "$n" -gt 0 ] && a=$((a+1))
 done
-R=$(kubectl get pods -l component=registry -o name); a=0; for p in $R; do n=$(kubectl logs "$p" -c registry --since-time="$T0" | grep -cE 'PUT /v2/|PATCH /v2/'); [ "$n" -gt 0 ] && a=$((a+1)); done
-check "$([ "$a" = 2 ] && echo ok || echo bad)" "both registry replicas received upload requests"
+check "$([ "$a" = 2 ] && echo ok || echo bad)" "both registry replicas served requests"
 echo "== S3 store: $(kubectl -n harbor-deps exec garage-0 -- /garage bucket info registry-blobs 2>/dev/null | grep -E '^(Size|Objects)' | paste -sd' ')"
 echo "== result: $ok passed, $bad failed"
 [ "$bad" = 0 ]

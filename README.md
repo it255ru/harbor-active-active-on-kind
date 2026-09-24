@@ -2,7 +2,7 @@
 
 Harbor in active-active mode on KinD: several replicas of core, portal, registry and jobservice behind ingress, sharing external PostgreSQL, Redis (Valkey) and S3-compatible object storage, with the goal of surviving the loss of a replica.
 
-**Status:** in progress. Phases 0-3 are done: the 14-node cluster, Infra LB, Consul, PostgreSQL under Patroni, Valkey with Sentinel, HAProxy (Harbor LB), Garage (S3) and Harbor itself (2 replicas each of core, portal, registry and jobservice) are up, and image and OCI chart push/pull work through the full chain (`make cluster infra-lb ha-deps harbor-ha deploy-app`). Milestone 1 (the whole stand working across the 14 nodes) was accepted on 2026-09-24; the failure tests (Phase 4, milestone 2) are next. The plan, design decisions (D1-D10) and acceptance criteria are in [backlog.md](backlog.md) (written in Russian).
+**Status:** the HA stand is built and verified: the 14-node cluster, Infra LB, Consul, PostgreSQL under Patroni, Valkey with Sentinel, HAProxy (Harbor LB), Garage (S3) and Harbor (2 replicas each of core, portal, registry and jobservice) are up, and milestone 1 (accepted 2026-09-24) and all failure tests of milestone 2 (H4.1-H4.7: push during a replica kill, rolling updates, node loss, app rollout, proxy-cache, loss of a role holder for Consul/Redis/PostgreSQL/Infra LB) were re-run on a stand rebuilt from scratch (`make cluster infra-lb ha-deps harbor-ha deploy-app`). Remaining work: final documentation review, porting the runbook to Ansible, an image cache for rebuilds. The plan, design decisions (D1-D10, D4a) and results are in [backlog.md](backlog.md) (written in Russian).
 
 ## Target architecture
 
