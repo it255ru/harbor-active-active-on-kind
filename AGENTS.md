@@ -1,18 +1,16 @@
-# Agent context: harbor-on-kind
+# Agent context: harbor-active-active-on-kind
 
-Local playground: **Harbor** on a **KinD** Kubernetes cluster, plus a tiny stdlib-only Python app (no pip deps) pushed to Harbor and deployed via kubectl/Helm.
+Goal: **Harbor in active-active (HA) mode** on **KinD** — multiple replicas behind ingress with shared external PostgreSQL, Redis and S3 storage. Started as a copy of `harbor-on-kind` @ `b65df71`, a working single-node lab (Harbor + a tiny stdlib-only Python demo app pushed to Harbor and deployed via kubectl/Helm).
 
-## Migration in progress
+## HA work in progress — not started yet
 
-Work follows **`backlog.md`** (Phases 0→6): bump from Kind `v0.17` / K8s `1.26` / Harbor `2.8` to the target stack below. Prefer implementing backlog items in order; do not invent alternate versions.
-
-Until a phase is done, `Makefile` / `hack/install.sh` may still show old or unpinned values — **target below is canonical**; sync code to match as you execute each phase.
+Work follows **`backlog.md`** (HA Phases 0→5). Open design decisions (D1–D4, D6; D5 is settled) belong to the user — ask, don't pick. Do not invent versions: any new component gets a pinned version recorded first. Everything in this file below describes the **inherited single-node baseline**, which is what `Makefile` / `hack/` currently implement; update it as HA phases land.
 
 ## Layout
 
 | Path | Role |
 |------|------|
-| `backlog.md` | Migration plan, pins, DoD — source of truth for the upgrade |
+| `backlog.md` | Harbor active-active plan, open decisions, pins — source of truth |
 | `Makefile` | KinD cluster lifecycle + Harbor install entrypoints |
 | `hack/install.sh` | Install MetalLB → ingress-nginx → Harbor (Helm), **with chart version pins** |
 | `hack/deploy-app.sh` | Build/push demo image, trust Harbor's CA on the node, deploy the app (`make deploy-app`, run after `install`) |
@@ -23,7 +21,7 @@ Until a phase is done, `Makefile` / `hack/install.sh` may still show old or unpi
 | `helm-hello-kube/` | Helm chart for the same app |
 | `bin/` | Local tools (kind); gitignored |
 
-## Canonical defaults (target stack)
+## Canonical defaults (baseline stack, single-node)
 
 - Cluster name: `harbor` → context `kind-harbor`
 - Kind CLI: `v0.30.0` (under `./bin`; delete stale binary after version bump)
@@ -56,4 +54,5 @@ Until a phase is done, `Makefile` / `hack/install.sh` may still show old or unpi
 - Keep Harbor hostname, credentials, and image paths consistent across Dockerfile tags, `deployment.yml`, and `helm-hello-kube/values.yaml`.
 - Prefer Helm OCI (`oci://…`) over ChartMuseum for chart distribution.
 - Do not commit secrets, `ca.crt`, or contents of `bin/`.
-- README is the human runbook (updated in Phase 6); this file is agent orientation.
+- README is the human runbook (still the single-node one until HA phases add to it); this file is agent orientation.
+- `CLUSTER` / `LB_IP` defaults intentionally match `harbor-on-kind` (only one lab cluster runs at a time — decision D5): `make cluster-delete` the other repo's cluster before `make cluster` here.

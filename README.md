@@ -1,4 +1,8 @@
-## ⚓ harbor-on-kind : Deploy Harbor locally using KinD
+## ⚓ harbor-active-active-on-kind : Harbor in active-active mode on KinD
+
+> **Status:** the HA work is planned but not started — see [`backlog.md`](backlog.md). This repo began as a copy of [harbor-on-kind](https://github.com/it255ru/harbor-on-kind); everything below is that **single-node baseline runbook**, which is what the `Makefile` and `hack/` scripts currently do. HA-specific sections will be added as the backlog phases land.
+
+### Deploy Harbor locally using KinD (single-node baseline)
 
 ### Requirenments
 - Linux laptop/workstation
