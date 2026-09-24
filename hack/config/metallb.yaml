@@ -25,3 +25,10 @@ frr-k8s:
         operator: Equal
         value: lb
         effect: NoSchedule
+    # the status-cleaner Deployment of the frr-k8s subchart ignores nodeSelector, only affinity applies
+    affinity:
+      nodeAffinity:
+        requiredDuringSchedulingIgnoredDuringExecution:
+          nodeSelectorTerms:
+            - matchExpressions:
+                - {key: harbor-ha/role, operator: In, values: [lb]}
