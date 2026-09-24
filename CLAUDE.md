@@ -28,6 +28,17 @@ Rules:
 | ingress-nginx chart | `4.15.1` (app `1.15.1`) |
 | Harbor chart / app | `1.19.2` / `2.15.2` |
 
+HA component pins (H0.1, 2026-09-24; images also pinned by digest — full refs and rationale in `backlog.md` → "Версии компонентов HA"):
+
+| Component | Pinned version |
+|-----------|----------------|
+| PostgreSQL | `18.6-alpine3.24` (Harbor 2.15.2 bundles 18.3) |
+| Patroni | `4.1.5` (PyPI; own image, extras `consul`, `psycopg3`) |
+| Consul | `1.22.7` (not 2.0.x) |
+| HAProxy | `3.4.4-alpine3.24` (current LTS) |
+| Valkey + Sentinel | `9.0.6-alpine3.24` (Harbor bundles 9.0.3) |
+| MinIO | `RELEASE.2025-09-07T16-13-09Z` (quay.io; community edition unmaintained) |
+
 Chart `1.19.2` HA-relevant keys (checked against its default values): `database.type: external` + `database.external.*`; `redis.type: external` + `redis.external.*` (bundled Redis in 2.15.2 is Valkey); `persistence.imageChartStorage.type: s3` (`disableredirect: true` for MinIO, `caBundleSecretName` for a self-signed store); `replicas` under `core`, `portal`, `registry`, `jobservice`, `trivy` (all `1` by default).
 
 Baseline was proven end to end: `make cluster` → `make add-host` → `make install` → `make deploy-app` → raw-YAML and Helm deploys, `helm test`, OCI chart push/pull.

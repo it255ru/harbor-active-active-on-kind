@@ -45,6 +45,24 @@
 
 Ключи chart `1.19.2`, относящиеся к HA (сверено по `helm show values harbor/harbor --version 1.19.2`): `database.type: external` + `database.external.*`; `redis.type: external` + `redis.external.*` (встроенный Redis в 2.15.2 — Valkey, `goharbor/valkey-photon`); `persistence.imageChartStorage.type: s3` (для MinIO — `disableredirect: true`, для самоподписанного сертификата хранилища — `caBundleSecretName`); `replicas` у `core`, `portal`, `registry`, `jobservice`, `trivy` (по умолчанию везде `1`).
 
+## Версии компонентов HA (зафиксированы 2026-09-24, H0.1)
+
+Проверено по реестрам (Docker Hub / quay.io / PyPI) и по образам Harbor 2.15.2 на 2026-09-24. Устанавливать только эти версии; менять — сначала здесь и в `CLAUDE.md`.
+
+| Компонент | Pin | Обоснование |
+|-----------|-----|-------------|
+| PostgreSQL | `postgres:18.6-alpine3.24@sha256:77f585114c32fbca283dc835b0596f4e52b51b4c6662d7810b2f4084f60a1873` | Встроенная БД Harbor 2.15.2 (`goharbor/harbor-db`) — PostgreSQL 18.3; берём тот же мажор 18 |
+| Patroni | `4.1.5` (PyPI, extras `consul` + `psycopg3`) | Готового поддерживаемого образа нет (Spilo: последний релиз 2023), поэтому свой образ: слой Patroni поверх образа PostgreSQL выше; версия базового Python — при сборке в Phase 2 |
+| Consul | `hashicorp/consul:1.22.7@sha256:a230dcea0bb107bd7958a912d1429fb7f9d399637de7ffb814b34412b9e8c543` | Последний 1.x. Есть 2.0.x (2.0.4), но это свежий мажор: совместимость с Patroni не проверена — не берём |
+| HAProxy | `haproxy:3.4.4-alpine3.24@sha256:52c5921e1619f39cbd5b25e1b4b5847667917f39745056cf004d9c263fbf11b9` | Текущий LTS (тег `lts` указывает на 3.4) |
+| Valkey (+ Sentinel) | `valkey/valkey:9.0.6-alpine3.24@sha256:187679e3bd4036959631e3f03983ab2ba503ab21e6fd0454d508e909db2ee989` | Встроенный Redis Harbor 2.15.2 — Valkey 9.0.3; тот же мажор. Sentinel — `valkey-sentinel` из того же образа (D3) |
+| MinIO | `quay.io/minio/minio:RELEASE.2025-09-07T16-13-09Z@sha256:14cea493d9a34af32f524e538b8346cf79f3321eff8e708c1e2960462bd8936e` | Последний обычный релиз с образом на quay.io; на GitHub есть `RELEASE.2025-10-15…`, но образа для него нет |
+
+**Заметки:**
+- MinIO: community-ветка фактически не развивается (новые образы не публикуются) — годится как учебный стенд-ин для Ceph RGW (D4), но не как эталон. Если понадобится живой проект — вернуться к D4.
+- PostgreSQL под Patroni: чарта/оператора не берём, манифесты свои (способ развёртывания — Phase 2). Образы закреплены и по тегу, и по digest.
+- Совместимость Harbor 2.15.2 с PostgreSQL 18 подтверждена косвенно (Harbor сам поставляется с 18.3), на внешней БД — проверить в H2.2/H3.3.
+
 ## Решения и открытые вопросы
 
 **Открытых решений нет** (все закрыты 2026-09-24). Если что-то изменится — вернуть сюда.
@@ -80,7 +98,7 @@
 
 ### Phase 0 — Решения и подготовка
 
-- [ ] **H0.1** Закрыть D6 (остальные решены — см. выше) и зафиксировать pinned-версии Patroni/PostgreSQL, Consul, HAProxy, Redis/Sentinel, MinIO в этом файле и в `CLAUDE.md` до установки.
+- [x] **H0.1** D6 закрыт, pinned-версии Patroni/PostgreSQL, Consul, HAProxy, Valkey/Sentinel, MinIO зафиксированы (2026-09-24) — раздел «Версии компонентов HA» выше и таблица в `CLAUDE.md`.
 - [x] **H0.2** `CLUSTER` / `LB_IP` / MetalLB-пул оставлены как в `harbor-on-kind` (D5). Если HA потребует больше LB-IP — расширить пул в той же подсети и обновить связанные файлы.
 - [ ] **H0.3** Сверить, что именно нужно шарить между репликами Harbor: логи jobservice (`jobservice.jobLoggers`), хранилище registry, Trivy-кэш — проверить по `helm show values` и документации Harbor HA, не по памяти.
 
