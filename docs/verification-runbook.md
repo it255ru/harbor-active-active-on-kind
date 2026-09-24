@@ -396,6 +396,69 @@ kubectl -n harbor-deps exec pg-0 -- sh -c "PGPASSWORD=\$PATRONI_SUPERUSER_PASSWO
 
 Ожидается на primary: `N|2` (соединения `harbor` от двух адресов, то есть от обоих HAProxy); на реплике `0`. Если лидер сменился, поменять `pg-0` на текущего лидера (V4.2).
 
+## 13. Phase 4 (веха 2): проверки отказоустойчивости
+
+Выполняются только после приёмки вехи 1. Здесь описываются по мере выполнения; результаты и выводы — в `backlog.md` (H4.x).
+
+### P4.1 push/pull образа и OCI-чарта при всех репликах
+
+Не разрушающая: все реплики работают, проверяется путь данных (в том числе multipart-загрузка в S3 и параллельные записи). Тестовые артефакты удаляются в конце.
+
+```bash
+mkdir /tmp/p41 && cd /tmp/p41
+T0=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+cat > Dockerfile <<'EOF'
+FROM core.harbor.domain/python/hello:1.0
+ARG N
+RUN dd if=/dev/urandom of=/blob-$N bs=1M count=40 2>/dev/null
+EOF
+for n in a b; do docker build -q --build-arg N=$n -t core.harbor.domain/python/hello:h41-$n . >/dev/null; done
+docker push core.harbor.domain/python/hello:h41-a & docker push core.harbor.domain/python/hello:h41-b & wait        # параллельный push, digest у обоих
+docker rmi core.harbor.domain/python/hello:h41-a core.harbor.domain/python/hello:h41-b
+docker pull core.harbor.domain/python/hello:h41-a; docker pull core.harbor.domain/python/hello:h41-b               # digest должны совпасть с pushed
+```
+
+Ожидается: оба `push` завершаются с `digest: sha256:...`, оба `pull` возвращают те же digest. Дальше:
+
+```bash
+# 1) pull через containerd ноды (pull secret harbor), под на control-plane
+kubectl run p41 --image=core.harbor.domain/python/hello:h41-a --restart=Never \
+  --overrides='{"spec":{"nodeSelector":{"node-role.kubernetes.io/control-plane":""},"tolerations":[{"key":"node-role.kubernetes.io/control-plane","operator":"Exists","effect":"NoSchedule"}],"imagePullSecrets":[{"name":"harbor"}]}}'
+kubectl wait --for=condition=ready pod/p41 --timeout=120s; kubectl get pod p41 -o jsonpath='{.status.containerStatuses[0].imageID}'; echo   # тот же digest
+kubectl delete pod p41
+
+# 2) OCI-чарт
+curl -sk https://core.harbor.domain/api/v2.0/systeminfo/getcert -o ca.crt
+echo Harbor12345 | helm registry login core.harbor.domain -u admin --password-stdin --ca-file ca.crt
+helm package --version 0.1.1 <репозиторий>/helm-hello-kube
+helm push --ca-file ca.crt hello-kube-0.1.1.tgz oci://core.harbor.domain/python/hello
+rm hello-kube-0.1.1.tgz; helm pull --ca-file ca.crt oci://core.harbor.domain/python/hello/hello-kube --version 0.1.1      # тот же digest
+helm install hello-kube --ca-file ca.crt oci://core.harbor.domain/python/hello/hello-kube --version 0.1.1
+helm test hello-kube; helm uninstall hello-kube; kubectl delete pod hello-kube-test-connection --ignore-not-found
+```
+
+Ожидается: `helm test` — `Phase: Succeeded`.
+
+Участие обеих реплик (счётчики с момента `T0`):
+
+```bash
+for p in $(kubectl get pods -l component=registry -o name); do
+  echo "$p PATCH=$(kubectl logs $p -c registry --since-time=$T0 | grep -c 'PATCH /v2/') PUT=$(kubectl logs $p -c registry --since-time=$T0 | grep -c 'PUT /v2/')"
+done
+```
+
+Ожидается: ненулевые PATCH/PUT у обоих подов registry; для core — разбор логов ingress-nginx как в разделе 12 (фильтр путей `/v2/`). В MinIO размер бакета вырастает примерно на объём загруженных слоёв (`mc du h/registry-blobs`, см. V8.2).
+
+Очистка тестовых данных:
+
+```bash
+curl -sk -u admin:Harbor12345 -X DELETE "https://core.harbor.domain/api/v2.0/projects/python/repositories/hello/artifacts/h41-a"
+curl -sk -u admin:Harbor12345 -X DELETE "https://core.harbor.domain/api/v2.0/projects/python/repositories/hello/artifacts/h41-b"
+curl -sk -u admin:Harbor12345 -X DELETE "https://core.harbor.domain/api/v2.0/projects/python/repositories/hello%252Fhello-kube/artifacts/0.1.1"
+```
+
+Удаление артефакта не освобождает блобы в MinIO: место вернёт только сборка мусора registry (GC), в лаборатории она не запускается.
+
 ## Диагностика
 
 | Симптом | Куда смотреть |
