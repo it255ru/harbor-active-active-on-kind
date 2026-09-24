@@ -4,7 +4,7 @@ Goal: **Harbor in active-active (HA) mode** on **KinD** — multiple replicas be
 
 ## HA work in progress — not started yet
 
-Work follows **`backlog.md`** (HA Phases 0→5). Open design decisions (D1–D4, D6; D5 is settled) belong to the user — ask, don't pick. Do not invent versions: any new component gets a pinned version recorded first. Everything in this file below describes the **inherited single-node baseline**, which is what `Makefile` / `hack/` currently implement; update it as HA phases land.
+Work follows **`backlog.md`** (HA Phases 0→5). No design decisions are open (see `backlog.md`: 14 nodes, Patroni + Consul ×3, HAProxy as Harbor LB, MinIO on its own node, D3 Redis Sentinel as an assumption). Success is two-staged: first the whole stand working across the 14 nodes (milestone 1, `H3.5`), only then the Phase 4 failure tests count. Target architecture: see `backlog.md` → "Целевая архитектура" (`hb-lb` balances PG/Redis, it is not the Harbor ingress). Do not invent versions: any new component gets a pinned version recorded first. Everything in this file below describes the **inherited single-node baseline**, which is what `Makefile` / `hack/` currently implement; update it as HA phases land.
 
 ## Layout
 
