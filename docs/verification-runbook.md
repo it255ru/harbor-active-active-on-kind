@@ -633,7 +633,7 @@ hack/tests/h47-role-failure.sh lb         # нода, анонсирующая �
 |---------|---------------|
 | Под `Pending` | `kubectl describe pod`: чаще всего нет toleration/`nodeSelector` под таинт роли; либо `podAntiAffinity` не находит свободной ноды |
 | `ErrImagePull` / `ImagePullBackOff` при старте | временный сбой Docker Hub/quay.io — ждать ретрая; образ Patroni `harbor-ha/patroni:4.1.5-pg18.6` грузится только `make pg-image` (`imagePullPolicy: Never`), после пересоздания кластера нужен `make postgres` |
-| Consul без лидера | `kubectl -n harbor-deps logs consul-0`; одинаковые имена нод (`-node=`), потерянные PVC |
+| Consul без лидера | `kubectl -n harbor-deps logs consul-0`; одинаковые имена нод (`-node=`), потерянные PVC; три отдельных кластера из одного узла (`consul members` на каждом поде показывает только себя): `-retry-join` не должен содержать собственное имя пода (так сделано в `consul.yaml`; ловушка проявляется, когда образ уже на ноде и все поды стартуют одновременно) |
 | Patroni не выбирает лидера | `patronictl ... list`, `logs pg-0`; доступность `consul.harbor-deps:8500`; пароли `pg-credentials` не совпадают с данными на PVC (Secret удалён, PVC остался) |
 | HAProxy: у PG/Redis нет `UP` | V5.2 и V6.1: primary/master есть? `logs deploy/harbor-lb`; после правки конфига HAProxy не перечитывает его сам — поднять аннотацию `config-version` в `hack/ha/haproxy.yaml` |
 | Sentinel: `flags s_down`/`o_down` | `logs redis-N -c sentinel`; резолвинг `redis-N.redis-headless.harbor-deps.svc.cluster.local` |

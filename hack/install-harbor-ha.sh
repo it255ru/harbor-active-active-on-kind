@@ -70,10 +70,15 @@ if ! kubectl -n "$NS" get secret harbor-ha-ingress-tls >/dev/null 2>&1; then
     --from-file=tls.crt="$tmp/tls.crt" --from-file=tls.key="$tmp/tls.key" --from-file=ca.crt="$tmp/ca.crt"
 fi
 
-helm repo add harbor https://helm.goharbor.io
-helm repo update harbor
+# The chart archive cached by `make images-save` is preferred over the repository.
+HARBOR_CHART="${IMAGE_CACHE:-$HOME/.cache/harbor-ha}/charts/harbor-1.19.2.tgz"
+if [ ! -f "$HARBOR_CHART" ]; then
+  helm repo add harbor https://helm.goharbor.io
+  helm repo update harbor
+  HARBOR_CHART=harbor/harbor
+fi
 # The post-renderer adds a preStop sleep to core/registry/portal so rolling updates do not drop requests
 # (see hack/helm-postrender.py; needs python3 + PyYAML).
-helm upgrade -i harbor harbor/harbor --version 1.19.2 -f "$CURDIR/config/harbor-ha.yaml" \
+helm upgrade -i harbor "$HARBOR_CHART" --version 1.19.2 -f "$CURDIR/config/harbor-ha.yaml" \
   --post-renderer "$CURDIR/helm-postrender.py" \
   ${DRY_RUN:+--dry-run=server}

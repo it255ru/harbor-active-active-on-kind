@@ -76,20 +76,19 @@ spec:
               valueFrom: {fieldRef: {fieldPath: metadata.name}}
             - name: POD_IP
               valueFrom: {fieldRef: {fieldPath: status.podIP}}
-          args:
-            - agent
-            - -server
-            - -ui
-            - -datacenter=harbor
-            - -node=$(POD_NAME)
-            - -data-dir=/consul/data
-            - -bind=$(POD_IP)
-            - -advertise=$(POD_IP)
-            - -client=0.0.0.0
-            - -bootstrap-expect=3
-            - -retry-join=consul-0.consul-headless.harbor-deps.svc.cluster.local
-            - -retry-join=consul-1.consul-headless.harbor-deps.svc.cluster.local
-            - -retry-join=consul-2.consul-headless.harbor-deps.svc.cluster.local
+          # -retry-join must list only the OTHER servers: a pod that finds its own record (published while
+          # not ready) counts that as a successful join and stops retrying, so with fast starts (cached images)
+          # all three pods ended up in separate one-node clusters. The wrapper drops the own name.
+          command:
+            - sh
+            - -c
+            - |
+              peers=""
+              for i in 0 1 2; do
+                [ "consul-$i" = "$POD_NAME" ] || peers="$peers -retry-join=consul-$i.consul-headless.harbor-deps.svc.cluster.local"
+              done
+              exec docker-entrypoint.sh agent -server -ui -datacenter=harbor -node="$POD_NAME" -data-dir=/consul/data \
+                -bind="$POD_IP" -advertise="$POD_IP" -client=0.0.0.0 -bootstrap-expect=3 $peers
           ports:
             - {name: http, containerPort: 8500}
             - {name: serflan, containerPort: 8301}

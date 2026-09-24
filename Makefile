@@ -21,8 +21,11 @@ KIND_IMAGE ?= kindest/node:v1.34.0@sha256:7416a61b42b1662ca6ca89f02028ac133a309a
 CLUSTER ?= harbor
 
 .PHONY: cluster
-cluster: kind ## Create the kind cluster.
-	$(KIND) create cluster --name $(CLUSTER) --image $(KIND_IMAGE) --config hack/config/kind-cluster.yaml
+cluster: kind ## Create the kind cluster (offline: `make images-load` first, the cached node image is used).
+	@img='$(KIND_IMAGE)'; \
+	if ! docker image inspect "$$img" >/dev/null 2>&1 && docker image inspect "$${img%@*}" >/dev/null 2>&1; then \
+	  echo "node image $$img not in Docker, using the cached $${img%@*}"; img="$${img%@*}"; fi; \
+	$(KIND) create cluster --name $(CLUSTER) --image "$$img" --config hack/config/kind-cluster.yaml
 
 .PHONY: cluster-delete
 cluster-delete: kind ## Delete the kind cluster.
@@ -121,6 +124,18 @@ s3: ## Install Garage (S3 stand-in for Ceph RGW) on the s3 node, bucket registry
 .PHONY: deploy-app
 deploy-app: ## Build, push, and deploy the demo app (run after `install`).
 	@CLUSTER=$(CLUSTER) HARBOR_HOST=$(HARBOR_HOST) LB_IP=$(LB_IP) ./hack/deploy-app.sh
+
+##@ Image cache
+
+.PHONY: images-save images-load images-check images-status
+images-save: ## Save the pinned third-party images and charts into the local cache (IMAGE_CACHE, default ~/.cache/harbor-ha).
+	@./hack/image-cache.sh save
+images-load: ## Load the cached images into the nodes (run after `make cluster`, before `make infra-lb`).
+	@CLUSTER=$(CLUSTER) KIND=$(KIND) ./hack/image-cache.sh load
+images-check: ## Check online that every pinned image and chart is still pullable (before deleting a working stand).
+	@./hack/image-cache.sh check
+images-status: ## Show what is in the image cache.
+	@./hack/image-cache.sh status
 
 ##@ Verification
 

@@ -69,6 +69,8 @@ make deploy-app    # project "python", demo image build/push, CA trust on the no
 make cluster-delete
 ```
 
+**Image cache (optional, recommended).** Every third-party image and chart is pinned, but a registry can still be slow or drop an artifact (MinIO's images vanished, Docker Hub can take minutes per image). `make images-save` keeps the 19 images of `hack/images.txt` and the three charts in `~/.cache/harbor-ha` (`IMAGE_CACHE=<dir>` to move it; about 4 GB, outside the repository); `make images-load` puts each image into containerd of only the nodes that need it. With a cache the build is `make images-load cluster images-load infra-lb ha-deps ...` (the first `images-load` prepares the Docker daemon, the second the nodes; `make cluster` uses the cached node image when the pinned one is absent). `make images-check` tells whether the originals are still pullable. Not cached: PyPI packages of the Patroni image and the `FROM` base images of the two local builds, which Docker cannot hold by digest after a load.
+
 `make install` runs `infra-lb` and `harbor-ha`. Every target is idempotent. The order of `ha-deps` matters (Patroni needs Consul, HAProxy needs the PostgreSQL and Redis backends). `make help` lists all targets; variables: `CLUSTER`, `KIND_IMAGE`, `KIND_VERSION`, `LB_IP`, `HARBOR_HOST`, `LOCALBIN`, `PG_IMAGE`.
 
 Measured from scratch (2026-09-24): `cluster` + `infra-lb` 4-9 min and `ha-deps` about 4.5 min (both dominated by image pulls), `harbor-ha` a few seconds plus 1-2 min for the pods, `deploy-app` 12-20 s.

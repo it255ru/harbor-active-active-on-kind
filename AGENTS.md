@@ -1,6 +1,6 @@
 # Agent context: harbor-active-active-on-kind
 
-Harbor in active-active (HA) mode on KinD: two replicas each of core, portal, registry and jobservice behind ingress, sharing external PostgreSQL (Patroni + Consul), Redis (Valkey + Sentinel) and S3 (Garage) on a 14-node cluster. The stand is built and verified (milestone 1 accepted 2026-09-24; failure tests H4.1–H4.7 and a from-scratch rebuild H5.3 passed). It started as a copy of `harbor-on-kind` @ `b65df71`. The runbook is also an Ansible playbook (`make verify`, H5.4). Open work: H5.5 (image cache for rebuilds, needs the user's decision).
+Harbor in active-active (HA) mode on KinD: two replicas each of core, portal, registry and jobservice behind ingress, sharing external PostgreSQL (Patroni + Consul), Redis (Valkey + Sentinel) and S3 (Garage) on a 14-node cluster. The stand is built and verified (milestone 1 accepted 2026-09-24; failure tests H4.1–H4.7 and a from-scratch rebuild H5.3 passed). It started as a copy of `harbor-on-kind` @ `b65df71`. The runbook is also an Ansible playbook (`make verify`, H5.4). The image cache for rebuilds exists (`make images-save` / `images-load`, H5.5); nothing else is open.
 
 Where to start: `backlog.md` (Russian, plan, decisions D1–D10/D4a, pins and results, source of truth), `CLAUDE.md` (rules, pinned versions, commands, gotchas: read it before changing anything), `README.md` (human runbook, sample output, failure behaviour), `docs/stand-topology.md` (nodes, roles, addresses, data, secrets; Russian), `docs/verification-runbook.md` (checks V1–V12 and failure-test procedures P4.1–P4.7; Russian).
 
@@ -17,6 +17,7 @@ Where to start: `backlog.md` (Russian, plan, decisions D1–D10/D4a, pins and re
 | `hack/deploy-app.sh` | Build/push the demo image, trust Harbor's CA on the node, deploy the app (`make deploy-app`) |
 | `hack/tests/` | Failure-test scripts and analyzers: `h41-push-pull.sh`, `h42-kill-during-push.sh`, `h43-rolling-update.sh`, `h44-node-loss.sh`, `h45-app-rollout.sh`, `h46-proxy-cache.sh`, `h47-role-failure.sh` (+ `h4x_analyze.py`) |
 | `ansible/` | `verify.yml` + roles `verify_*` (V1..V12), `group_vars/all.yml` (numbers, addresses), `files/s3-access.sh`; run with `make verify` |
+| `hack/images.txt`, `hack/image-cache.sh` | Pinned third-party images with node roles; local cache (`~/.cache/harbor-ha`), `make images-save/load/check/status` |
 | `hack/add_host.sh` | Add the Harbor hostname to `/etc/hosts` |
 | `hack/phase0-prepare.sh` | Phase 0 host tool checks, writes `hack/phase0-baseline.log` |
 | `hack/config/harbor.yaml` | Legacy single-node Harbor values, no target uses it |

@@ -1,0 +1,34 @@
+# Third-party artifacts the stand pulls at build time, pinned as in hack/ha/*.yaml, hack/config/*.yaml and the Makefile.
+# Used by hack/image-cache.sh (make images-save / images-load / images-check).
+# <ref> <where>: comma-separated harbor-ha/role values of the nodes that need the image (containerd there gets it
+# with `kind load`), plus the pseudo-roles `host` (only the local Docker daemon: kind node image, docker build base)
+# and `cp` (control-plane). Keep in sync with the pins in CLAUDE.md when a version changes.
+
+# kind node image (used by `make cluster`)
+kindest/node:v1.34.0@sha256:7416a61b42b1662ca6ca89f02028ac133a309a2a30ba309614e8ec94d976dc5a  host
+# base image of the demo app (docker build in hack/deploy-app.sh) and of the Patroni image (make pg-image)
+python:3-alpine@sha256:9e9fde4d32eedce0b661d9ab91e826b62dddf28e928c230ec55f1866cac66b01  host
+postgres:18.6-alpine3.24@sha256:77f585114c32fbca283dc835b0596f4e52b51b4c6662d7810b2f4084f60a1873  host,pg,app
+
+# Infra LB (make infra-lb)
+quay.io/metallb/controller:v0.16.1  lb
+quay.io/metallb/speaker:v0.16.1  lb
+quay.io/metallb/frr-k8s:v0.0.25  lb
+quay.io/frrouting/frr:10.4.3  lb
+registry.k8s.io/ingress-nginx/controller:v1.15.1@sha256:594ceea76b01c592858f803f9ff4d2cb40542cae2060410b2c95f75907d659e1  lb
+# admission webhook certificate Job of the ingress-nginx chart (runs on the lb nodes, see hack/config/nginx.yaml)
+registry.k8s.io/ingress-nginx/kube-webhook-certgen:v1.6.9@sha256:01038e7de14b78d702d2849c3aad72fd25903c4765af63cf16aa3398f5d5f2dd  lb
+
+# dependencies (make ha-deps); the Verify job V9 also runs postgres and valkey on the app nodes
+hashicorp/consul:1.22.7@sha256:a230dcea0bb107bd7958a912d1429fb7f9d399637de7ffb814b34412b9e8c543  consul
+valkey/valkey:9.0.6-alpine3.24@sha256:187679e3bd4036959631e3f03983ab2ba503ab21e6fd0454d508e909db2ee989  redis,app
+haproxy:3.4.4-alpine3.24@sha256:52c5921e1619f39cbd5b25e1b4b5847667917f39745056cf004d9c263fbf11b9  lb
+dxflrs/garage:v2.4.1@sha256:9c96caa2612d3411acc5b0e6701fb238dbfba33e533a6d7d3d811a4b12d0d020  s3
+
+# Harbor 2.15.2 (make harbor-ha)
+goharbor/harbor-core:v2.15.2  app
+goharbor/harbor-jobservice:v2.15.2  app
+goharbor/harbor-portal:v2.15.2  app
+goharbor/harbor-registryctl:v2.15.2  app
+goharbor/registry-photon:v2.15.2  app
+goharbor/trivy-adapter-photon:v2.15.2  app

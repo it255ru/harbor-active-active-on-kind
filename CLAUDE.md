@@ -2,7 +2,7 @@
 
 Repo: **harbor-active-active-on-kind**. Harbor in active-active (HA) mode on KinD: two replicas each of core/portal/registry/jobservice behind ingress, sharing external PostgreSQL (Patroni + Consul), Redis (Valkey + Sentinel) and S3 (Garage), on a 14-node cluster. It started on 2026-09-24 as a copy of `harbor-on-kind` @ `b65df71` (https://github.com/it255ru/harbor-on-kind, full history kept, not a GitHub fork).
 
-**Status:** Phases 0–4 are done and were re-verified on a stand rebuilt from scratch (milestone 1 accepted by the user on 2026-09-24; failure tests H4.1–H4.7 and the from-scratch acceptance H5.3 passed). H5.4 is done (Ansible port of the runbook, `make verify`). Open: H5.5 (image cache for rebuilds, needs the user's decision). `backlog.md` (Russian) is the source of truth; see also `AGENTS.md` (layout, flow) and `README.md` (human runbook).
+**Status:** Phases 0–4 are done and were re-verified on a stand rebuilt from scratch (milestone 1 accepted by the user on 2026-09-24; failure tests H4.1–H4.7 and the from-scratch acceptance H5.3 passed). H5.4 is done (Ansible port of the runbook, `make verify`). H5.5 is done (image cache, `make images-save` / `images-load`). Nothing else is open in `backlog.md`. `backlog.md` (Russian) is the source of truth; see also `AGENTS.md` (layout, flow) and `README.md` (human runbook).
 
 ## Rules
 
@@ -12,7 +12,7 @@ Repo: **harbor-active-active-on-kind**. Harbor in active-active (HA) mode on Kin
 - Target architecture: Harbor app ×2 → Harbor LB ×2 (HAProxy, in front of PostgreSQL and Redis, **not** the Harbor ingress) → PostgreSQL ×2 under Patroni with state in Consul ×3, Redis ×3; blobs in S3 (Ceph in prod, Garage here); Infra LB (ingress-nginx + MetalLB) in front. Backups, Prometheus and Nexus are out of scope.
 - **One lab cluster at a time (D5):** the defaults (`CLUSTER=harbor`, `LB_IP=172.20.0.100`, pool `172.20.0.100–110`) match `harbor-on-kind`; `make cluster-delete` the other repo's cluster before `make cluster` here. The host's `/etc/hosts` entry and Docker `insecure-registries` for `core.harbor.domain` are reused.
 - The failure tests kill real nodes and pods. Say what you are about to break before doing it, run one test at a time on a healthy stand, wait for the host load to settle (`cut -d' ' -f1 /proc/loadavg` < 3), and clean up by digest.
-- Before `make cluster-delete` of a working stand, check that every pinned image and chart is still pullable anonymously (MinIO's images vanished from quay.io between two builds).
+- Before `make cluster-delete` of a working stand, run `make images-save` (cache complete) and `make images-check` (pinned images and charts still pullable; `UNKNOWN` = registry timeout, not absence). MinIO's images vanished from quay.io between two builds. A new third-party image must be added to `hack/images.txt` with its node roles.
 - Report faithfully: a failed or skipped check is reported as such, with its output.
 - `sudo` is interactive-only in agent sessions: `make add-host` (missing entry) and the Docker `insecure-registries` change are run by the user; `make deploy-app` prints the exact commands.
 - Never write to the user's `~/.aws` (no `aws configure set`); for S3 checks use an isolated `AWS_CONFIG_FILE` / `AWS_SHARED_CREDENTIALS_FILE` (runbook V8.2).
@@ -49,6 +49,8 @@ make harbor-ha       # hack/install-harbor-ha.sh: Secrets in `default` (once), t
 make install         # infra-lb + harbor-ha
 make deploy-app      # project `python`, build/push demo image, CA trust on the control-plane node, pull secret, deploy (idempotent)
 make verify          # ansible/verify.yml: checks V1..V12 with a PASS/FAIL table, non-zero exit on FAIL (TAGS=V5,V6, EXTRA='-e verify_rollout=true'); needs pip `kubernetes` + collection kubernetes.core
+make images-save     # hack/image-cache.sh: pinned third-party images + charts (hack/images.txt) into ~/.cache/harbor-ha (IMAGE_CACHE=)
+make images-load     # cached images into the nodes of the right role (run before `make cluster` for the Docker daemon, again after it for the nodes); images-check / images-status
 make cluster-ctx     # kubectl use-context kind-harbor
 make cluster-delete
 ```
@@ -63,6 +65,7 @@ Variables: `CLUSTER`, `KIND_IMAGE`, `KIND_VERSION`, `LB_IP`, `HARBOR_HOST`, `LOC
 - `hack/add_host.sh` skips the entry if the hostname is present (it will not fix a wrong IP). Use `systemctl reload docker`, not `restart`, while a cluster runs.
 - The subnet of the Docker `kind` network varies per machine (`docker network inspect kind`; here `172.20.0.0/16`). Changing `LB_IP` means updating together: `Makefile`, `hack/config/lb-ipaddresspool.yaml`, `hack/config/nginx.yaml`, host `/etc/hosts`, the node's `/etc/hosts`, README examples.
 - Everything shares one host disk: gigabytes of writes (image builds with `dd`, big pushes) stall etcd/apiserver, crash controller-manager/scheduler (leader election; lease 60/40/10 s is set in `kind-cluster.yaml`) and trigger Sentinel failovers (`down-after` 15000). Keep test data small.
+- Image cache (`hack/image-cache.sh`): `docker save` drops the name of a digest-pinned image, so images are saved under `cache.local/...:cached` and re-tagged inside the node with `ctr -n k8s.io images tag` to the pinned name; do not replace this with a plain `kind load docker-image`.
 - Cold-start image pulls fail transiently (`ErrImagePull`): pods self-heal. Third-party images can vanish (MinIO). The output of `make pg-image` is loaded with `kind load` into the `pg` nodes only and disappears with the cluster.
 - MetalLB L2: if a `LoadBalancer` IP never resolves (ARP `(incomplete)`, speaker flapping `serviceAnnounced`/`serviceWithdrawn`), check `kubectl get endpoints <svc>` and pod status first.
 
