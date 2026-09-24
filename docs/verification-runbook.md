@@ -8,6 +8,8 @@
 
 ## Подготовка
 
+Схема стенда (ноды, роли, адреса, порты): `docs/stand-topology.md`.
+
 ```bash
 cd harbor-active-active-on-kind
 make cluster-ctx                     # контекст kind-harbor

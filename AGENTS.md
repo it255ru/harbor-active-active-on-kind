@@ -14,6 +14,7 @@ Work follows **`backlog.md`** (HA Phases 0→5). No design decisions are open (s
 | `Makefile` | KinD cluster lifecycle + Harbor install entrypoints |
 | `hack/install-infra.sh` | Infra LB: MetalLB → ingress-nginx on the `lb` nodes (`make infra-lb`), **with chart version pins** |
 | `hack/install.sh` | `install-infra.sh`, then Harbor (Helm) — baseline values, not HA yet |
+| `docs/stand-topology.md` | Stand map: nodes and roles, addresses and ports, data locations, secrets (Russian) |
 | `docs/verification-runbook.md` | Stand verification runbook (V1..V10 checks with expected results); to be ported to Ansible (H5.4) |
 | `hack/install-harbor-ha.sh` | Harbor HA install (`make harbor-ha`): Secrets in `default`, then pinned Helm chart with `hack/config/harbor-ha.yaml` |
 | `hack/ha/` | HA dependency manifests: `consul.yaml`, `postgres.yaml` + `patroni/` (image build), `redis.yaml`, `haproxy.yaml`, `minio.yaml` |

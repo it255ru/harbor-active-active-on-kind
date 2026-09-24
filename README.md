@@ -80,6 +80,8 @@ make deploy-app    # project, image build/push, CA trust, pull secret, demo app
 
 ### Topology and placement
 
+Full map of the nodes, roles, addresses, ports, data locations and secrets: [docs/stand-topology.md](docs/stand-topology.md).
+
 Workers carry the label and taint `harbor-ha/role=<role>` (`NoSchedule`). kind names them `harbor-worker` (app), `harbor-worker2` (app), `3-4` (lb), `5-6` (pg), `7-9` (redis), `10-12` (consul), `13` (s3). Anything new must set both a `nodeSelector` and a matching toleration, otherwise it stays `Pending`. Which pod lands on which node within a role is not fixed; check with `kubectl get pods -A -o wide`.
 
 The Infra LB shares the `lb` nodes with HAProxy (there are no dedicated ingress nodes in the 14-node layout).
