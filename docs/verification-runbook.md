@@ -1,0 +1,375 @@
+# Ранбук: проверка стенда
+
+Как проверить, что лабораторный стенд Harbor active-active собран правильно и здоров. Это те же проверки, которые выполнялись при аудите перед Phase 3 (2026-09-24); их можно запускать самому в любой момент: после `make cluster infra-lb ha-deps`, после правок манифестов, перед началом новой фазы.
+
+Ранбук проверяет **состояние и распределение** (веха 1). Отказоустойчивость (падение primary PostgreSQL, master Redis, HAProxy, ноды) сюда не входит: это Phase 4 / веха 2 в `backlog.md`.
+
+Документ написан так, чтобы его можно было механически перевести в Ansible (см. последний раздел): у каждой проверки есть идентификатор, команда, ожидаемый результат и что делать при отказе.
+
+## Подготовка
+
+```bash
+cd harbor-active-active-on-kind
+make cluster-ctx                     # контекст kind-harbor
+kubectl config current-context       # ожидается: kind-harbor
+```
+
+Переменные, которые используются в командах ниже:
+
+| Что | Значение | Откуда |
+|-----|----------|--------|
+| Namespace зависимостей | `harbor-deps` | `hack/ha/00-namespace.yaml` |
+| Адрес Infra LB | `172.20.0.100` | `Makefile` (`LB_IP`) |
+| Роли и число нод | `app` 2, `lb` 2, `pg` 2, `redis` 3, `consul` 3, `s3` 1 | `hack/config/kind-cluster.yaml` |
+
+Признак успеха везде указан в строке «Ожидается». Если результат отличается, смотрите «При отказе» и раздел «Диагностика» в конце.
+
+## 1. Кластер
+
+**V1.1 Все 14 нод `Ready`**
+
+```bash
+kubectl get nodes --no-headers | awk '$2!="Ready"' | wc -l      # Ожидается: 0
+kubectl get nodes --no-headers | wc -l                          # Ожидается: 14
+```
+
+При отказе: `docker ps` (контейнеры нод живы?), `docker logs harbor-worker<N>`, лимиты inotify (`sysctl fs.inotify.max_user_instances fs.inotify.max_user_watches`, нужно 2048 и 1048576).
+
+**V1.2 Роли нод**
+
+```bash
+kubectl get nodes -o custom-columns=NAME:.metadata.name,ROLE:'.metadata.labels.harbor-ha\/role' --no-headers \
+  | awk '{print $2}' | sort | uniq -c
+```
+
+Ожидается: `app` 2, `consul` 3, `lb` 2, `pg` 2, `redis` 3, `s3` 1 и одна нода `<none>` (control-plane).
+
+При отказе: кластер собран не из `hack/config/kind-cluster.yaml`. Пересоздать: `make cluster-delete && make cluster`.
+
+**V1.3 Таинты ролей**
+
+```bash
+kubectl get nodes -o custom-columns=NAME:.metadata.name,TAINT:'.spec.taints[*].key' --no-headers | grep -c 'harbor-ha/role'   # Ожидается: 13
+```
+
+## 2. Поды и размещение
+
+**V2.1 Нет подов не в `Running`/`Completed`**
+
+```bash
+kubectl get pods -A --no-headers | awk '$4!="Running" && $4!="Completed"'      # Ожидается: пусто
+```
+
+**V2.2 Нет рестартов**
+
+```bash
+kubectl get pods -A --no-headers | awk '$5+0>0'                                # Ожидается: пусто
+```
+
+Единичный рестарт сразу после сборки не критичен, но его причину стоит посмотреть: `kubectl -n <ns> logs <pod> --previous`.
+
+**V2.3 Предупреждения (информационная)**
+
+```bash
+kubectl get events -A --field-selector type=Warning --no-headers | awk '{print $1,$5,$6,$7,$8}' | sort | uniq -c
+```
+
+Ничего не «ожидается»: смотреть глазами. Известные безвредные: `Readiness probe failed` при старте `pg-*`/`redis-*`/`consul-*`; `ErrImagePull`/`ImagePullBackOff` при холодной загрузке образов (Docker Hub / quay.io), поды поднимаются сами. Тревожно, если предупреждения повторяются на уже `Running` поде.
+
+**V2.4 Каждый под стоит на ноде своей роли**
+
+```bash
+kubectl get nodes -o custom-columns=N:.metadata.name,R:'.metadata.labels.harbor-ha\/role' --no-headers > /tmp/noderoles.txt
+kubectl get pods -A -o custom-columns=NS:.metadata.namespace,POD:.metadata.name,NODE:.spec.nodeName,WANT:'.spec.nodeSelector.harbor-ha\/role',PH:.status.phase --no-headers \
+  | awk 'NR==FNR{r[$1]=$2; next}
+         $1!="kube-system" && $1!="local-path-storage" && $5=="Running" {
+           want=$4
+           if (want=="<none>" && $2 ~ /^(ingress-nginx|metallb)/) want="lb"   # у этих подов свой способ закрепления (affinity)
+           if (want=="<none>") print "NO-SELECTOR", $2
+           else if (r[$3]!=want) print "MISPLACED", $2, "want", want, "on", r[$3]
+         }' /tmp/noderoles.txt -
+```
+
+Ожидается: пусто. Если появились `MISPLACED` — под попал на чужую роль (таинт не сработал или у пода неверный selector). `NO-SELECTOR` — новый компонент без `nodeSelector`/toleration: добавить.
+
+**V2.5 Реплики одной роли на разных нодах**
+
+```bash
+kubectl -n harbor-deps get pods --field-selector=status.phase=Running \
+  -o custom-columns=APP:.metadata.labels.app,NODE:.spec.nodeName --no-headers | sort | uniq -d
+```
+
+Ожидается: пусто (нет двух подов одного приложения на одной ноде). Сводка «сколько подов где»:
+
+```bash
+kubectl -n harbor-deps get pods -o wide
+```
+
+Ожидается: `consul-*` — 3 разные consul-ноды; `pg-*` — 2 pg-ноды; `redis-*` — 3 redis-ноды; `harbor-lb-*` — 2 lb-ноды; `minio-0` — s3-нода.
+
+## 3. Infra LB
+
+**V3.1 Две реплики ingress-nginx на разных `lb`-нодах**
+
+```bash
+kubectl get pods -o wide --no-headers | grep ingress-nginx-controller | awk '{print $1,$2,$3,$7}'
+```
+
+Ожидается: 2 пода `1/1 Running` на `harbor-worker3` и `harbor-worker4` (или тех нодах, что имеют роль `lb`).
+
+**V3.2 Адрес балансировщика**
+
+```bash
+kubectl get svc ingress-nginx-controller --no-headers | awk '{print $4}'       # Ожидается: 172.20.0.100
+docker network inspect -f '{{range .IPAM.Config}}{{.Subnet}} {{end}}' kind      # Ожидается: содержит 172.20.0.0/16
+```
+
+При отказе (подсеть другая): менять `LB_IP` и связанные файлы, см. README, «Load balancer IP».
+
+**V3.3 Балансировщик отвечает с хоста**
+
+```bash
+curl -s -o /dev/null -w '%{http_code}\n' -m 5 http://172.20.0.100/              # Ожидается: 404
+curl -sk -o /dev/null -w '%{http_code}\n' -m 5 https://172.20.0.100/            # Ожидается: 404
+```
+
+`404` от default backend ingress-nginx — норма, пока не установлен Harbor (правил Ingress ещё нет). Отсутствие ответа — см. «Диагностика», раздел MetalLB. `ping` не отвечает и не должен: MetalLB в L2-режиме на ICMP не отвечает.
+
+**V3.4 Компоненты MetalLB**
+
+```bash
+kubectl get pods --no-headers | grep -E 'metallb' | awk '{print $1,$2,$3}'
+kubectl get ipaddresspool,l2advertisement -A --no-headers
+```
+
+Ожидается: controller, 2 speaker, 2 frr-k8s, statuscleaner — все `Running`; пул `172.20.0.100-172.20.0.110` и `l2advertisement`.
+
+## 4. Consul
+
+**V4.1 Кворум и лидер**
+
+```bash
+kubectl -n harbor-deps exec consul-0 -- consul operator raft list-peers
+kubectl -n harbor-deps exec consul-0 -- consul members
+```
+
+Ожидается: три сервера в raft, из них 1 `leader` и 2 `follower` (Voter `true`), у фолловеров `Trails Leader By` = `0 commits`; в `members` три `alive` сервера.
+
+При отказе (`No cluster leader`, менее 3 серверов): `kubectl -n harbor-deps logs consul-0`; типичная причина — одинаковые имена нод (`-node=` не из `POD_NAME`) или потерянные PVC.
+
+**V4.2 Patroni записал состояние в Consul**
+
+```bash
+kubectl -n harbor-deps exec consul-0 -- consul kv get service/harbor-pg/leader   # Ожидается: имя текущего лидера, pg-0 или pg-1
+```
+
+## 5. PostgreSQL / Patroni
+
+**V5.1 Состояние кластера**
+
+```bash
+kubectl -n harbor-deps exec pg-0 -- patronictl -c /etc/patroni/patroni.yml list
+```
+
+Ожидается: ровно один `Leader` в состоянии `running` и одна `Replica` в состоянии `streaming`, `Lag` = 0.
+
+**V5.2 REST-проверки Patroni (те же, что использует HAProxy)**
+
+```bash
+kubectl -n harbor-deps exec pg-0 -- curl -s -o /dev/null -w 'pg-0 primary %{http_code}\n' http://pg-0.pg-headless:8008/primary
+kubectl -n harbor-deps exec pg-0 -- curl -s -o /dev/null -w 'pg-1 primary %{http_code}\n' http://pg-1.pg-headless:8008/primary
+kubectl -n harbor-deps exec pg-0 -- curl -s -o /dev/null -w 'pg-1 replica %{http_code}\n' http://pg-1.pg-headless:8008/replica
+```
+
+Ожидается (если лидер `pg-0`): `200`, `503`, `200`. Если лидер сменился, значения на нодах меняются местами.
+
+**V5.3 Вход под пользователем Harbor через Harbor LB попадает на primary**
+
+```bash
+PGPASS=$(kubectl -n harbor-deps get secret pg-credentials -o jsonpath='{.data.harbor}' | base64 -d)
+kubectl -n harbor-deps exec pg-1 -- psql "postgresql://harbor:$PGPASS@harbor-lb.harbor-deps:5432/registry" \
+  -Atc "select 'in_recovery=' || pg_is_in_recovery()"
+```
+
+Ожидается: `in_recovery=false` (даже если команда запущена из пода реплики: HAProxy отправляет на primary).
+
+**V5.4 Репликация (запись на primary видна на реплике)**
+
+```bash
+LEADER=$(kubectl -n harbor-deps exec consul-0 -- consul kv get service/harbor-pg/leader)      # pg-0 или pg-1
+REPLICA=$([ "$LEADER" = pg-0 ] && echo pg-1 || echo pg-0)
+kubectl -n harbor-deps exec $LEADER  -- psql "postgresql://harbor:$PGPASS@$LEADER.pg-headless:5432/registry" -Atc "create table v54_probe(i int); insert into v54_probe values (42)"
+sleep 2
+kubectl -n harbor-deps exec $REPLICA -- psql "postgresql://harbor:$PGPASS@$REPLICA.pg-headless:5432/registry" -Atc "select pg_is_in_recovery(), i from v54_probe"
+kubectl -n harbor-deps exec $LEADER  -- psql "postgresql://harbor:$PGPASS@$LEADER.pg-headless:5432/registry" -Atc "drop table v54_probe"
+```
+
+Ожидается: `t|42` (реплика в recovery и видит строку). Пробная таблица удаляется в последней команде; если проверка оборвалась раньше — удалить `v54_probe` вручную.
+
+## 6. Redis (Valkey + Sentinel)
+
+**V6.1 Роли**
+
+```bash
+for i in 0 1 2; do kubectl -n harbor-deps exec redis-$i -c valkey -- valkey-cli role | head -1; done | paste -sd' '
+```
+
+Ожидается: один `master` и два `slave` (порядок зависит от того, кто мастер).
+
+**V6.2 Кворум Sentinel и текущий master**
+
+```bash
+kubectl -n harbor-deps exec redis-0 -c sentinel -- valkey-cli -p 26379 sentinel ckquorum mymaster
+kubectl -n harbor-deps exec redis-0 -c sentinel -- valkey-cli -p 26379 sentinel get-master-addr-by-name mymaster
+kubectl -n harbor-deps exec redis-0 -c sentinel -- valkey-cli -p 26379 sentinel master mymaster | paste -sd' ' | grep -oE 'flags [^ ]+|num-slaves [0-9]+|num-other-sentinels [0-9]+|quorum [0-9]+'
+```
+
+Ожидается: `OK 3 usable Sentinels...`; адрес `redis-N.redis-headless...` и порт `6379`; `flags master` (не `s_down`/`o_down`), `num-slaves 2`, `num-other-sentinels 2`, `quorum 2`.
+
+**V6.3 Пароль обязателен, запись реплицируется**
+
+```bash
+kubectl -n harbor-deps exec redis-0 -c valkey -- sh -c 'env -u REDISCLI_AUTH valkey-cli ping'      # Ожидается: NOAUTH Authentication required.
+kubectl -n harbor-deps exec redis-0 -c valkey -- sh -c 'valkey-cli -h harbor-lb.harbor-deps set v63 ok'     # OK (на мастере, через Harbor LB)
+kubectl -n harbor-deps exec redis-2 -c valkey -- valkey-cli get v63                                           # ok (читается с любой реплики)
+kubectl -n harbor-deps exec redis-0 -c valkey -- sh -c 'valkey-cli -h harbor-lb.harbor-deps del v63'         # 1
+```
+
+Пароль берётся из переменной окружения контейнера (`REDISCLI_AUTH`), в командной строке не передаётся.
+
+## 7. Harbor LB (HAProxy)
+
+**V7.1 Два пода на разных `lb`-нодах**
+
+```bash
+kubectl -n harbor-deps get pods -l app=harbor-lb -o wide --no-headers | awk '{print $1,$2,$3,$7}'
+```
+
+Ожидается: 2 пода `1/1 Running` на разных нодах.
+
+**V7.2 Бэкенды: по одному живому на PG и на Redis (на каждом HAProxy)**
+
+```bash
+for p in $(kubectl -n harbor-deps get pods -l app=harbor-lb -o name); do
+  kubectl -n harbor-deps exec $p -- wget -qO- 'http://127.0.0.1:8404/stats;csv' \
+    | awk -F, '($1=="postgres"||$1=="redis")&&$2!="BACKEND"&&$2!="FRONTEND"{printf "%s:%s=%s ",$1,$2,$18}'; echo
+done
+```
+
+Ожидается, для обоих подов: `postgres:<primary>=UP`, второй PG `DOWN`; `redis:<master>=UP`, две реплики `DOWN`. `DOWN` у реплик — норма: HAProxy пускает трафик только на primary/master. Если `UP` нет ни у одного PG или Redis — HAProxy не видит primary/master (см. V5.2 и V6.1).
+
+Веб-статистика: `kubectl -n harbor-deps port-forward deploy/harbor-lb 8404:8404`, затем http://127.0.0.1:8404/stats.
+
+## 8. MinIO
+
+**V8.1 Под на `s3`-ноде, инициализация выполнена**
+
+```bash
+kubectl -n harbor-deps get pod minio-0 -o wide --no-headers | awk '{print $1,$2,$3,$7}'     # Ожидается: 1/1 Running на s3-ноде
+kubectl -n harbor-deps get job minio-init --no-headers                                       # Ожидается: Complete 1/1
+kubectl -n harbor-deps logs job/minio-init | tail -1                                         # Ожидается: init done
+```
+
+**V8.2 Доступ пользователя Harbor только к своему бакету**
+
+```bash
+AK=$(kubectl -n harbor-deps get secret minio-credentials -o jsonpath='{.data.harbor-access-key}' | base64 -d)
+SK=$(kubectl -n harbor-deps get secret minio-credentials -o jsonpath='{.data.harbor-secret-key}' | base64 -d)
+MC=quay.io/minio/mc:RELEASE.2025-08-13T08-35-41Z@sha256:a7fe349ef4bd8521fb8497f55c6042871b2ae640607cf99d9bede5e9bdf11727
+kubectl run v82 --rm -i --restart=Never --image=$MC \
+  --overrides='{"spec":{"nodeSelector":{"harbor-ha/role":"app"},"tolerations":[{"key":"harbor-ha/role","operator":"Equal","value":"app","effect":"NoSchedule"}]}}' \
+  --command -- sh -c "export MC_CONFIG_DIR=/tmp/mc; mc alias set h http://minio.harbor-deps:9000 $AK $SK >/dev/null \
+    && echo probe > /tmp/p && mc cp /tmp/p h/registry-blobs/v82 && mc cat h/registry-blobs/v82 && mc rm h/registry-blobs/v82; \
+    mc mb h/other 2>&1 | tail -1"
+```
+
+Ожидается: запись, чтение (`probe`) и удаление в `registry-blobs` проходят; `mc mb h/other` — `Access Denied`. Тест-под запускается на `app`-ноде (как будет работать Harbor) и удаляется сам (`--rm`).
+
+## 9. Доступность из namespace Harbor
+
+Проверяет цепочку так, как её увидит Harbor: тестовые поды в namespace `default` на `app`-ноде ходят на единые адреса. Образы берутся те же, что и в манифестах (закреплены по digest).
+
+```bash
+OV='{"spec":{"nodeSelector":{"harbor-ha/role":"app"},"tolerations":[{"key":"harbor-ha/role","operator":"Equal","value":"app","effect":"NoSchedule"}]}}'
+g(){ kubectl -n harbor-deps get secret "$1" -o jsonpath="{.data.$2}" | base64 -d; }
+PGI=postgres:18.6-alpine3.24@sha256:77f585114c32fbca283dc835b0596f4e52b51b4c6662d7810b2f4084f60a1873
+VKI=valkey/valkey:9.0.6-alpine3.24@sha256:187679e3bd4036959631e3f03983ab2ba503ab21e6fd0454d508e909db2ee989
+
+# V9.1 PostgreSQL через Harbor LB + V9.2 Consul
+kubectl run v91 --rm -i --restart=Never --image=$PGI --overrides="$OV" --env=PGPASSWORD=$(g pg-credentials harbor) --command -- sh -c '
+  psql "host=harbor-lb.harbor-deps port=5432 user=harbor dbname=registry connect_timeout=5" -Atc "select not pg_is_in_recovery()";
+  wget -qO- http://consul.harbor-deps:8500/v1/status/leader; echo'
+
+# V9.3 Redis через Harbor LB
+kubectl run v93 --rm -i --restart=Never --image=$VKI --overrides="$OV" --env=REDISCLI_AUTH=$(g redis-credentials password) --command -- \
+  sh -c 'valkey-cli -h harbor-lb.harbor-deps set v93 ok && valkey-cli -h harbor-lb.harbor-deps get v93 && valkey-cli -h harbor-lb.harbor-deps del v93'
+```
+
+Ожидается: `t` и адрес лидера Consul в кавычках (V9.1–V9.2); `OK`, `ok`, `1` (V9.3). Доступность MinIO из `default` проверяется командой V8.2 (она уже запускается в `default`). Служебные строки `If you don't see a command prompt` и `pod ... deleted` — норма.
+
+## 10. Ресурсы хоста
+
+```bash
+docker stats --no-stream --format '{{.Name}} {{.MemUsage}}' | sort -k2 -h       # память по нодам
+free -g | sed -n 2p                                                              # свободная память хоста
+df -h /                                                                          # свободное место
+sysctl fs.inotify.max_user_instances fs.inotify.max_user_watches                 # 2048 и 1048576
+```
+
+Ориентиры (2026-09-24, без Harbor): около 3,9 ГиБ на 14 нод; control-plane около 740 МиБ, `lb`-ноды 500–540, `pg` 290–310, `s3` около 360, остальные 120–180. Со всем стендом оценка 12–13 ГиБ.
+
+## Диагностика
+
+| Симптом | Куда смотреть |
+|---------|---------------|
+| Под `Pending` | `kubectl describe pod`: чаще всего нет toleration/`nodeSelector` под таинт роли; либо `podAntiAffinity` не находит свободной ноды |
+| `ErrImagePull` / `ImagePullBackOff` при старте | временный сбой Docker Hub/quay.io — ждать ретрая; образ Patroni `harbor-ha/patroni:4.1.5-pg18.6` грузится только `make pg-image` (`imagePullPolicy: Never`), после пересоздания кластера нужен `make postgres` |
+| Consul без лидера | `kubectl -n harbor-deps logs consul-0`; одинаковые имена нод (`-node=`), потерянные PVC |
+| Patroni не выбирает лидера | `patronictl ... list`, `logs pg-0`; доступность `consul.harbor-deps:8500`; пароли `pg-credentials` не совпадают с данными на PVC (Secret удалён, PVC остался) |
+| HAProxy: у PG/Redis нет `UP` | V5.2 и V6.1: primary/master есть? `logs deploy/harbor-lb`; после правки конфига HAProxy не перечитывает его сам — поднять аннотацию `config-version` в `hack/ha/haproxy.yaml` |
+| Sentinel: `flags s_down`/`o_down` | `logs redis-N -c sentinel`; резолвинг `redis-N.redis-headless.harbor-deps.svc.cluster.local` |
+| MinIO `Access Denied` у Harbor | `minio-init` не завершился (V8.1); повторить `make minio` |
+| `172.20.0.100` не отвечает | `kubectl get endpoints ingress-nginx-controller` (нет Ready-подов — MetalLB не держит анонс), `kubectl logs -l app.kubernetes.io/component=speaker`, подсеть `kind` (V3.2) |
+| Сбросить один компонент | удалить его Secret **и** PVC (`data-<имя>-N`), затем `make <таргет>`; удалять только Secret нельзя: новый пароль не совпадёт с данными |
+| Всё сломалось | `make cluster-delete && make cluster && make infra-lb && make ha-deps` (около 11 минут) |
+
+## Что ранбук не проверяет
+
+- Отказы и переключения (Patroni failover, Sentinel failover, потеря одного HAProxy, потеря ноды): Phase 4 (H4.x) в `backlog.md`, засчитываются только после приёмки вехи 1 (H3.5).
+- Сам Harbor (Phase 3): после установки добавятся проверки UI, push/pull образа и OCI-чарта, работы обеих реплик core/portal/registry/jobservice и наличия блобов в бакете MinIO. Они опишутся в этом же документе.
+- Производительность и нагрузка.
+
+## Перевод в Ansible (план)
+
+Цель: те же проверки как воспроизводимый плейбук, который запускается одной командой и даёт сводный отчёт.
+
+**Принципы:**
+
+- Одна проверка = одна задача (или блок) с тем же идентификатором (`V5.1` и т.д.) в `name:`; это даёт готовые теги (`--tags V5`) и читаемый отчёт.
+- Проверки только читают: `changed_when: false`. Проверки с записью (V5.4, V6.3, V8.2, V9.x) используют уникальные ключи/таблицы и обязательно убирают за собой (`always:` в `block`).
+- Ожидаемое значение проверяется через `failed_when`/`assert` (`that:` + `fail_msg:` из колонки «При отказе»), а не глазами.
+- Пароли берутся из Secret'ов кластера (`kubernetes.core.k8s_info` + `b64decode`), задачи с ними — `no_log: true`.
+- Топология не хардкодится: ожидаемые числа нод по ролям, namespace, `LB_IP` — переменные (`group_vars/all.yml`), источник правды — `hack/config/kind-cluster.yaml` и `Makefile`.
+
+**Соответствие модулям:**
+
+| Проверки | Ansible |
+|----------|---------|
+| V1, V2, V3.1, V3.2, V3.4, V7.1, V8.1 | `kubernetes.core.k8s_info` (Node, Pod, Service, Job) + `assert` по ответу; V2.4 и V2.5 — расчёт в Jinja2 по списку подов и нод |
+| V4, V5.1, V5.2, V6.1, V6.2, V7.2 | `kubernetes.core.k8s_exec` (`consul`, `patronictl`, `curl`, `valkey-cli`, `wget`) с разбором вывода (`patronictl list -f json`, CSV статистики HAProxy) |
+| V3.3 | `ansible.builtin.uri` (`status_code: 404`, `validate_certs: false` для HTTPS) |
+| V3.2 (подсеть) | `community.docker.docker_network_info` или `command: docker network inspect` |
+| V5.3, V5.4, V6.3, V8.2, V9 | `kubernetes.core.k8s` (создание и удаление тест-Pod/Job) + чтение логов через `k8s_log`; либо `k8s_exec` в уже существующие поды, где это возможно |
+| V10 | `command: docker stats` / `ansible.builtin.setup` (память и диск хоста), `sysctl` |
+
+**Предполагаемая структура (не создана):**
+
+```text
+ansible/
+  verify.yml                # playbook: роли по разделам, теги V1..V10
+  group_vars/all.yml        # namespace, LB_IP, ожидаемое число нод по ролям
+  roles/verify_cluster/ verify_pods/ verify_infra_lb/ verify_consul/
+        verify_postgres/ verify_redis/ verify_haproxy/ verify_minio/ verify_e2e/ verify_host/
+```
+
+Требуются коллекции `kubernetes.core` (и опционально `community.docker`) и Python-модуль `kubernetes` на управляющей машине. Итог плейбука: сводная таблица «проверка — результат» и ненулевой код возврата при любом отказе, чтобы его можно было запускать по расписанию и в CI. В `backlog.md` это оформлено как H5.4.

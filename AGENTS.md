@@ -14,6 +14,7 @@ Work follows **`backlog.md`** (HA Phases 0→5). No design decisions are open (s
 | `Makefile` | KinD cluster lifecycle + Harbor install entrypoints |
 | `hack/install-infra.sh` | Infra LB: MetalLB → ingress-nginx on the `lb` nodes (`make infra-lb`), **with chart version pins** |
 | `hack/install.sh` | `install-infra.sh`, then Harbor (Helm) — baseline values, not HA yet |
+| `docs/verification-runbook.md` | Stand verification runbook (V1..V10 checks with expected results); to be ported to Ansible (H5.4) |
 | `hack/ha/` | HA dependency manifests: `consul.yaml`, `postgres.yaml` + `patroni/` (image build), `redis.yaml`, `haproxy.yaml`, `minio.yaml` |
 | `hack/deploy-app.sh` | Build/push demo image, trust Harbor's CA on the node, deploy the app (`make deploy-app`, run after `install`) |
 | `hack/phase0-prepare.sh` | Phase 0 baseline checks → `hack/phase0-baseline.log` |

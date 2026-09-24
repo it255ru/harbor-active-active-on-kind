@@ -44,6 +44,10 @@ Chart `1.19.2` HA-relevant keys (checked against its default values): `database.
 
 Baseline was proven end to end: `make cluster` → `make add-host` → `make install` → `make deploy-app` → raw-YAML and Helm deploys, `helm test`, OCI chart push/pull.
 
+## Verification
+
+`docs/verification-runbook.md` is the runbook for checking the stand (checks V1..V10, expected results, diagnostics). Run the relevant checks after any change to `hack/ha/` or `hack/config/`, and keep the runbook in sync when components or commands change. It is meant to be ported to Ansible later (`backlog.md` H5.4).
+
 ## Commands
 
 ```bash

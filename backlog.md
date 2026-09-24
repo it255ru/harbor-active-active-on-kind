@@ -133,6 +133,7 @@
 - После пересборки: 14/14 `Ready`; нет подов не в `Running`/`Completed` и нет рестартов; каждый под на ноде своей роли, реплики на разных нодах; Consul — 1 leader + 2 follower; Patroni — Leader + Replica (streaming, lag 0); Sentinel — «3 usable Sentinels»; оба HAProxy — PG и Redis по одному UP (primary/master); `minio-init` — `init done`; `http://172.20.0.100/` → 404 (ingress жив), подсеть `kind` `172.20.0.0/16`.
 - Все манифесты `hack/ha/*.yaml` и `lb-ipaddresspool.yaml` проходят `kubectl apply --dry-run=server`; `yamllint` чист; `bash -n` для скриптов ок; секретов и паролей в репозитории нет (пароли генерируются в Secret).
 - Замер памяти (`docker stats`) с Phase 0–2 без Harbor: ≈ 3,9 ГиБ на 14 нод (control-plane ≈ 740 МиБ, `lb`-ноды ≈ 500–540 МиБ, `pg` ≈ 290–310, `s3` ≈ 360, остальные ≈ 120–180); на хосте свободно ≈ 27 ГБ, диск — 97 ГБ. Оценка «≈ 12–13 ГиБ» относилась ко всему стенду с Harbor — перемерить после H3.3.
+- Найдено и исправлено при подготовке ранбука: под `metallb-frr-k8s-statuscleaner` не имел закрепления за `lb` (subchart frr-k8s игнорирует nodeSelector для него) — в `hack/config/metallb.yaml` добавлен `nodeAffinity` (`frr-k8s.frrk8s.affinity`), применено `make infra-lb` (helm revision 2), под перезапущен на `lb`-ноде, ingress и MetalLB работают (`http://172.20.0.100/` → 404).
 - Замеченное и не ошибка: при холодном старте образов `ErrImagePull`/`ImagePullBackOff` (сбой токена Docker Hub, разовый `NotFound` на quay.io) — Kubernetes ретраит, поды поднимаются сами.
 - Известные ограничения перед Phase 3: baseline-`make install` / `make deploy-app` на этом кластере не работают (нет tolerations в `harbor.yaml`) — чинится в H3.1; правка конфига HAProxy требует ручного bump аннотации `config-version`; failover PG/Redis/HAProxy не проверялся (веха 2).
 
@@ -159,6 +160,7 @@
 - [ ] **H5.1** `README.md`: HA-раздел, актуальные примеры вывода.
 - [ ] **H5.2** `AGENTS.md` / `CLAUDE.md` под фактическое состояние.
 - [ ] **H5.3** Acceptance с нуля: `cluster-delete` → `cluster` → зависимости → `install` (HA) → `deploy-app` → проверки Phase 4.
+- [ ] **H5.4** Перевести `docs/verification-runbook.md` в Ansible-плейбук (`ansible/verify.yml`, теги V1..V10, `kubernetes.core`, сводный отчёт и ненулевой код возврата при отказе); план соответствия модулям — в конце ранбука.
 
 ## Риски и заметки
 

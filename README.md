@@ -98,6 +98,8 @@ The services keep their state on PVCs, and that state contains the passwords tha
 
 ### Verifying the stand
 
+The full step-by-step runbook (what to run, what to expect, what to do on failure, and a plan to port it to Ansible) is in [docs/verification-runbook.md](docs/verification-runbook.md). Quick smoke test:
+
 ```bash
 kubectl get nodes                                    # 14 x Ready
 kubectl get pods -A -o wide                          # every pod on a node of its own role
