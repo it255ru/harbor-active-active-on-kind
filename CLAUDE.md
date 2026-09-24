@@ -2,9 +2,9 @@
 
 Repo: **harbor-active-active-on-kind**. Goal: run **Harbor in active-active (HA) mode** on KinD — several replicas of core/portal/registry/jobservice (maybe trivy) behind ingress, sharing external PostgreSQL, Redis (Valkey) and S3-compatible object storage — and prove it survives losing a replica.
 
-**Provenance:** started 2026-09-24 as a copy of `harbor-on-kind` @ `b65df71` (full git history kept; not a GitHub fork, since GitHub forbids same-owner forks). Original single-node lab: https://github.com/it255ru/harbor-on-kind. Everything under "Baseline" below is verified-working *single-node* behavior inherited from there. **The HA work itself is not started** — the plan and the open design decisions are in `backlog.md` (written in Russian, source of truth).
+**Provenance:** started 2026-09-24 as a copy of `harbor-on-kind` @ `b65df71` (full git history kept; not a GitHub fork, since GitHub forbids same-owner forks). Original single-node lab: https://github.com/it255ru/harbor-on-kind. Everything under "Baseline" below is verified-working *single-node* behavior inherited from there. **HA work status:** Phases 0–2 done (14-node cluster, Infra LB, Consul, Patroni/PostgreSQL, Valkey/Sentinel, HAProxy, MinIO); Phase 3 (Harbor in HA) is next — the plan and decisions are in `backlog.md` (written in Russian, source of truth).
 
-See also: `AGENTS.md` (agent orientation), `README.md` (still the single-node runbook; HA sections get added as phases land).
+See also: `AGENTS.md` (agent orientation), `README.md` (status, requirements and command list; Harbor HA sections get added as Phase 3 lands).
 
 ## HA work — read `backlog.md` first
 
@@ -38,6 +38,7 @@ HA component pins (H0.1, 2026-09-24; images also pinned by digest — full refs 
 | HAProxy | `3.4.4-alpine3.24` (current LTS) |
 | Valkey + Sentinel | `9.0.6-alpine3.24` (Harbor bundles 9.0.3) |
 | MinIO | `RELEASE.2025-09-07T16-13-09Z` (quay.io; community edition unmaintained) |
+| MinIO client `mc` | `RELEASE.2025-08-13T08-35-41Z` (quay.io; one-shot bucket/user init Job) |
 
 Chart `1.19.2` HA-relevant keys (checked against its default values): `database.type: external` + `database.external.*`; `redis.type: external` + `redis.external.*` (bundled Redis in 2.15.2 is Valkey); `persistence.imageChartStorage.type: s3` (`disableredirect: true` for MinIO, `caBundleSecretName` for a self-signed store); `replicas` under `core`, `portal`, `registry`, `jobservice`, `trivy` (all `1` by default).
 
@@ -47,9 +48,17 @@ Baseline was proven end to end: `make cluster` → `make add-host` → `make ins
 
 ```bash
 make help            # list targets
-make cluster         # installs ./bin/kind via `go install` if missing, creates cluster "harbor" (context kind-harbor)
+make cluster         # installs ./bin/kind via `go install` if missing, creates the 14-node cluster "harbor" from hack/config/kind-cluster.yaml (context kind-harbor)
 make add-host        # appends "$LB_IP $HARBOR_HOST" to /etc/hosts (uses sudo)
-make install         # hack/install.sh: helm repos → MetalLB → IPAddressPool → ingress-nginx → Harbor
+make infra-lb        # hack/install-infra.sh: MetalLB → IPAddressPool → ingress-nginx, both on the `lb` nodes (tolerate the role taint)
+make ha-deps        # consul → postgres → redis → harbor-lb → minio in order (after `make cluster infra-lb`); the targets below can also be run individually
+make consul          # hack/ha/consul.yaml: Consul x3 StatefulSet in namespace harbor-deps on the consul nodes (DCS for Patroni)
+make pg-image        # build hack/ha/patroni (PostgreSQL 18.6 + Patroni 4.1.5) and `kind load` it into the pg nodes
+make postgres        # pg-image + hack/ha/postgres.yaml: PostgreSQL x2 under Patroni, Secret pg-credentials generated on first run (needs `make consul`)
+make redis           # hack/ha/redis.yaml: Valkey x3 + Sentinel sidecars on the redis nodes, Secret redis-credentials generated on first run
+make harbor-lb       # hack/ha/haproxy.yaml: HAProxy x2 on the lb nodes; Service harbor-lb.harbor-deps :5432 (PG primary via Patroni /primary) and :6379 (Redis master)
+make minio           # hack/ha/minio.yaml: MinIO on the s3 node + bucket registry-blobs + scoped user for Harbor (Secret minio-credentials generated on first run)
+make install         # hack/install.sh: infra-lb, then Harbor (baseline values only — no HA tolerations yet, Harbor pods stay Pending on the tainted nodes until Phase 3)
 make deploy-app      # hack/deploy-app.sh: project `python` → docker login/build/push → node CA trust → pull secret → kubectl apply + rollout restart (run after `install`; idempotent)
 make cluster-ctx     # kubectl use-context kind-harbor
 make cluster-delete
@@ -57,7 +66,7 @@ make cluster-delete
 ./hack/phase0-prepare.sh [--create-branch] [--init-git]   # host tool checks (docker/helm/go/kubectl); rewrites hack/phase0-baseline.log
 ```
 
-Overridable Make vars: `CLUSTER`, `KIND_IMAGE`, `KIND_VERSION`, `LB_IP`, `HARBOR_HOST`, `LOCALBIN`.
+Overridable Make vars: `CLUSTER`, `KIND_IMAGE`, `KIND_VERSION`, `LB_IP`, `HARBOR_HOST`, `LOCALBIN`, `PG_IMAGE`.
 
 Gotchas:
 - The Makefile runs `go env GOBIN` at parse time — Go must be on `PATH` even for `make help`.
@@ -68,6 +77,11 @@ Gotchas:
 - `sudo` is interactive-only in agent sessions: `make add-host` (when the entry is missing) and the host Docker `insecure-registries` change must be run by the user. `make deploy-app` fails fast with the exact commands if the latter is missing.
 - `make deploy-app` always redoes the node's CA trust + `systemctl restart containerd` (Harbor's self-signed CA regenerates on every install). Pods survive; ones already `Terminating` may take longer to disappear — transient, not a hang.
 - Use `systemctl reload docker`, not `restart`, after editing `daemon.json` while a cluster is running.
+- HA stand: every worker is tainted `harbor-ha/role=<role>:NoSchedule`; any new workload needs a matching `nodeSelector` + toleration. Dependencies live in namespace `harbor-deps` (`hack/ha/`); passwords are generated on the first run into Secrets there — to reset a component delete its Secret **and** PVCs together.
+- `make pg-image` output (`harbor-ha/patroni:4.1.5-pg18.6`) is loaded with `kind load` into the `pg` nodes only and vanishes with the cluster.
+- Cold-start image pulls fail transiently (`ErrImagePull`); pods self-heal, don't rebuild the cluster.
+- Kubernetes does not expand `$(HOSTNAME)` in `args` — use the downward API env (`POD_NAME`).
+- HAProxy needs a bump of the `config-version` annotation in `hack/ha/haproxy.yaml` to roll after a config change.
 
 ## Architecture / coupling (baseline, single-node)
 

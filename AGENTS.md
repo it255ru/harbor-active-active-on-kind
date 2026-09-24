@@ -2,9 +2,9 @@
 
 Goal: **Harbor in active-active (HA) mode** on **KinD** — multiple replicas behind ingress with shared external PostgreSQL, Redis and S3 storage. Started as a copy of `harbor-on-kind` @ `b65df71`, a working single-node lab (Harbor + a tiny stdlib-only Python demo app pushed to Harbor and deployed via kubectl/Helm).
 
-## HA work in progress — not started yet
+## HA work in progress — Phases 0–2 done
 
-Work follows **`backlog.md`** (HA Phases 0→5). No design decisions are open (see `backlog.md`: 14 nodes, Patroni + Consul ×3, HAProxy as Harbor LB, MinIO on its own node, D3 Redis Sentinel as an assumption). Success is two-staged: first the whole stand working across the 14 nodes (milestone 1, `H3.5`), only then the Phase 4 failure tests count. Target architecture: see `backlog.md` → "Целевая архитектура" (`hb-lb` balances PG/Redis, it is not the Harbor ingress). Do not invent versions: any new component gets a pinned version recorded first. Everything in this file below describes the **inherited single-node baseline**, which is what `Makefile` / `hack/` currently implement; update it as HA phases land.
+Work follows **`backlog.md`** (HA Phases 0→5). No design decisions are open (see `backlog.md`: 14 nodes, Patroni + Consul ×3, HAProxy as Harbor LB, MinIO on its own node, D3 Redis Sentinel as an assumption). Success is two-staged: first the whole stand working across the 14 nodes (milestone 1, `H3.5`), only then the Phase 4 failure tests count. Target architecture: see `backlog.md` → "Целевая архитектура" (`hb-lb` balances PG/Redis, it is not the Harbor ingress). Do not invent versions: any new component gets a pinned version recorded first. Done so far: 14-node cluster (`hack/config/kind-cluster.yaml`), Infra LB, Consul, Patroni/PostgreSQL, Valkey/Sentinel, HAProxy, MinIO (`make cluster infra-lb ha-deps`; manifests in `hack/ha/`, dependencies live in namespace `harbor-deps`, generated credentials in Secrets there). **Phase 3 (Harbor in HA) is next**; until it lands, `make install` / `make deploy-app` do not work on this cluster (all workers are tainted by role, and `hack/config/harbor.yaml` has no tolerations). The "baseline" sections below describe the inherited single-node behavior.
 
 ## Layout
 
@@ -12,10 +12,12 @@ Work follows **`backlog.md`** (HA Phases 0→5). No design decisions are open (s
 |------|------|
 | `backlog.md` | Harbor active-active plan, open decisions, pins — source of truth |
 | `Makefile` | KinD cluster lifecycle + Harbor install entrypoints |
-| `hack/install.sh` | Install MetalLB → ingress-nginx → Harbor (Helm), **with chart version pins** |
+| `hack/install-infra.sh` | Infra LB: MetalLB → ingress-nginx on the `lb` nodes (`make infra-lb`), **with chart version pins** |
+| `hack/install.sh` | `install-infra.sh`, then Harbor (Helm) — baseline values, not HA yet |
+| `hack/ha/` | HA dependency manifests: `consul.yaml`, `postgres.yaml` + `patroni/` (image build), `redis.yaml`, `haproxy.yaml`, `minio.yaml` |
 | `hack/deploy-app.sh` | Build/push demo image, trust Harbor's CA on the node, deploy the app (`make deploy-app`, run after `install`) |
 | `hack/phase0-prepare.sh` | Phase 0 baseline checks → `hack/phase0-baseline.log` |
-| `hack/config/` | Helm values / MetalLB pool (`harbor.yaml`, `nginx.yaml`, `lb-ipaddresspool.yaml`) |
+| `hack/config/` | `kind-cluster.yaml` (14 nodes), Helm values / MetalLB pool (`harbor.yaml`, `nginx.yaml`, `metallb.yaml`, `lb-ipaddresspool.yaml`) |
 | `hack/add_host.sh` | Append Harbor hostname to `/etc/hosts` |
 | `python-docker-hello-kube/` | Sample stdlib `http.server` app, Dockerfile, raw `deployment.yml` |
 | `helm-hello-kube/` | Helm chart for the same app |
