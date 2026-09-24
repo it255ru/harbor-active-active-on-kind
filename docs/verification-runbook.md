@@ -547,6 +547,40 @@ DEGRADE=1 hack/tests/h45-app-rollout.sh      # перед rollout убиты о�
 
 Если новый под в `ErrImagePull` с `x509: certificate signed by unknown authority` — containerd ноды не доверяет текущему CA Harbor (см. «Диагностику»). После завершения проверить, что `hello:1.0` на месте: `curl -sk -u admin:Harbor12345 https://core.harbor.domain/api/v2.0/projects/python/repositories/hello/artifacts`.
 
+### P4.6 Proxy-cache проект (Docker Hub)
+
+Создаёт временный endpoint и proxy-cache проект, кратковременно отрезает Docker Hub на уровне DNS кластера, убивает по одной паре core+registry, всё возвращает и удаляет проект. Требует доступа из подов Harbor к Docker Hub (`registry-1.docker.io`, `hub.docker.com`) и нескольких небольших анонимных pull (у Docker Hub есть лимит).
+
+```bash
+hack/tests/h46-proxy-cache.sh                 # ~4 минуты; в конце проект и endpoint удаляются
+KEEP=1 hack/tests/h46-proxy-cache.sh          # оставить проект и endpoint
+```
+
+Ожидается: `13 passed, 0 failed`. Что проверяется:
+
+- проект создан как proxy-cache (`registry_id`), холодный pull через Harbor даёт тот же digest, что сам Docker Hub;
+- кэш зарегистрирован в проекте (асинхронно, до ~40 с);
+- при недоступном Docker Hub (`curl` из пода core → 000): кэшированный образ тянется по digest платформы, слой скачивается через Harbor с верным sha256, не кэшированный образ не тянется;
+- то же при убитой сначала паре №1, затем паре №2 (core+registry);
+- локальный проект `python` работает, push в proxy-проект отклоняется;
+- после возврата Docker Hub не кэшированный образ и pull по тегу работают.
+
+Справочно (INFO, не проверяется): pull по тегу при недоступном апстриме не работает (`artifact …:tag not found`); pull по digest индекса может проходить, пока у пода core открыто соединение с Docker Hub.
+
+Восстановление, если скрипт прерван: исходный Corefile CoreDNS не содержит блока `template`; проверить `kubectl -n kube-system get cm coredns -o jsonpath='{.data.Corefile}' | grep template` (пусто = норма), при необходимости вернуть Corefile и выполнить `kubectl -n kube-system rollout restart deploy/coredns`. Временные проект и endpoint: `curl -sk -u admin:Harbor12345 https://core.harbor.domain/api/v2.0/projects` и `/registries`.
+
+Ручная настройка proxy-cache (для справки):
+
+```bash
+API=https://core.harbor.domain/api/v2.0
+curl -sk -u admin:Harbor12345 -X POST $API/registries -H 'Content-Type: application/json' \
+  -d '{"name":"dockerhub","type":"docker-hub","url":"https://hub.docker.com","insecure":false}'
+RID=$(curl -sk -u admin:Harbor12345 $API/registries | python3 -c "import sys,json; print(json.load(sys.stdin)[0]['id'])")
+curl -sk -u admin:Harbor12345 -X POST $API/projects -H 'Content-Type: application/json' \
+  -d "{\"project_name\":\"dockerhub-proxy\",\"registry_id\":$RID,\"public\":true}"
+docker pull core.harbor.domain/dockerhub-proxy/library/alpine:3.20
+```
+
 ## Диагностика
 
 | Симптом | Куда смотреть |
@@ -567,6 +601,9 @@ DEGRADE=1 hack/tests/h45-app-rollout.sh      # перед rollout убиты о�
 | При rolling update клиенты получают 502, в логах core `proxy error: dial tcp <ClusterIP registry>:5000: connect: connection refused` | под останавливается раньше, чем маршрутизация убрала его; проверить `preStop` у core/registry/portal (`kubectl get deploy harbor-registry -o jsonpath='{.spec.template.spec.containers[*].lifecycle}'`); `preStop` добавляет `hack/helm-postrender.py` при `make harbor-ha` (нужен PyYAML) |
 | После потери ноды поды Harbor остались `Pending` (`didn't match pod topology spread constraints`) | так и должно быть, пока жива одна `app`-нода: `maxSkew: 1` не пускает вторую реплику на ту же ноду; сервис работает на одной реплике, после возврата ноды Deployment'ы возвращаются к `2/2` сами (≈ 1 мин); `harbor-trivy-0` ждёт свою ноду (PVC привязан к ней) |
 | Новые pod-ы приложения в `ErrImagePull`: `x509: certificate signed by unknown authority` при pull с `core.harbor.domain` | containerd ноды не доверяет текущему CA Harbor. С `harbor-ha-ingress-tls` CA стабилен и не меняется при `helm upgrade`; если ошибка есть, сравнить серийники: `curl -sk https://core.harbor.domain/api/v2.0/systeminfo/getcert \| openssl x509 -noout -serial` и `docker exec harbor-control-plane openssl x509 -in /usr/local/share/ca-certificates/harbor-ca.crt -noout -serial`; при различии `make deploy-app` (переустанавливает доверие) |
+| Proxy-cache: pull по тегу не работает при недоступном апстриме (`artifact …:tag not found`) | так устроен Harbor: кэшируется манифест платформы по digest, тег резолвит апстрим; тянуть по digest (`repo@sha256:…`), digest платформы виден в `GET /projects/<проект>/repositories/<репо>/artifacts` |
+| Proxy-cache: репозиторий в проекте пуст, хотя pull работает | кэш регистрируется асинхронно (до ~40 с), либо проект с тем же именем уже проксировал этот путь раньше (остатки в S3 после удаления через API); использовать проект с новым именем |
+| Создание endpoint Docker Hub: ошибка при `POST /registries` | Harbor пингует `hub.docker.com`; проверить доступ из пода core (`curl https://hub.docker.com`, `https://registry-1.docker.io/v2/` → 401); после снятия блокировки DNS перезапустить CoreDNS (`kubectl -n kube-system rollout restart deploy/coredns`) |
 | Сбросить один компонент | удалить его Secret **и** PVC (`data-<имя>-N`), затем `make <таргет>`; удалять только Secret нельзя: новый пароль не совпадёт с данными |
 | Всё сломалось | `make cluster-delete && make cluster && make infra-lb && make ha-deps` (около 11 минут) |
 
