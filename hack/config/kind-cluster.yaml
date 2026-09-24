@@ -4,7 +4,7 @@
 # Worker order defines kind node names: harbor-worker, harbor-worker2, ...
 kind: Cluster
 apiVersion: kind.x-k8s.io/v1alpha4
-# Everything (14 node containers, etcd, MinIO, PostgreSQL) shares one host disk: a burst of I/O made
+# Everything (14 node containers, etcd, the S3 store, PostgreSQL) shares one host disk: a burst of I/O made
 # the apiserver slow enough that controller-manager and scheduler lost their leader-election lease and
 # crashed (H4.2). Longer lease/renew windows keep them alive through such stalls.
 kubeadmConfigPatches:

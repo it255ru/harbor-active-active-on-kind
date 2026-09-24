@@ -8,7 +8,7 @@
 #
 # How it works
 #   * builds an image with random (incompressible) layers on top of python/hello:1.0;
-#   * throttles egress of the app nodes with tc (registry -> MinIO), so the upload lasts long enough
+#   * throttles egress of the app nodes with tc (registry -> S3), so the upload lasts long enough
 #     to be caught, and always removes the throttle on exit;
 #   * finds the pod that is actually receiving the upload by the growth of its eth0 rx counter and
 #     deletes it with --force --grace-period=0 (a crash, not a graceful stop);
@@ -23,7 +23,7 @@ set -uo pipefail
 COMP=${1:?registry|core}; CTR=${2:?container}; TAG=${3:?tag}
 LAYERS=${LAYERS:-2}; SIZE_MB=${SIZE_MB:-200}
 HOST=${HARBOR_HOST:-core.harbor.domain}; AUTH=${HARBOR_AUTH:-admin:Harbor12345}
-W="${WORKDIR:-$(mktemp -d)}"; cd "$W"
+W="${WORKDIR:-$(mktemp -d)}"; mkdir -p "$W"; cd "$W" || exit 1
 IMG=$HOST/python/hello:$TAG
 
 rx() { kubectl exec "$1" -c "$CTR" -- grep eth0 /proc/net/dev 2>/dev/null | tr -d '\r' | awk '{print $2}'; }

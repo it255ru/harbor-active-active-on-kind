@@ -24,18 +24,18 @@ expose:
       core: core.harbor.domain
     className: nginx
 
-# Registry blobs go to MinIO and job logs to the database, so no shared RWX volume is needed;
+# Registry blobs go to the S3 stand-in (Garage) and job logs to the database, so no shared RWX volume is needed;
 # the only PVC left is Trivy's cache (StatefulSet volumeClaimTemplate, ReadWriteOnce per replica).
 persistence:
   enabled: true
   imageChartStorage:
     type: s3
-    disableredirect: true   # MinIO is not reachable from clients, registry must proxy blobs
+    disableredirect: true   # S3 is not reachable from clients, registry must proxy blobs
     s3:
       existingSecret: harbor-ha-s3   # keys REGISTRY_STORAGE_S3_ACCESSKEY / REGISTRY_STORAGE_S3_SECRETKEY (loaded whole into registry)
       region: us-east-1
       bucket: registry-blobs
-      regionendpoint: http://minio.harbor-deps.svc.cluster.local:9000
+      regionendpoint: http://s3.harbor-deps.svc.cluster.local:3900
       secure: false
       v4auth: true
 

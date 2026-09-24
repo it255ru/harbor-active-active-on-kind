@@ -71,7 +71,7 @@ install: ## Install Harbor.
 ##@ HA dependencies
 
 .PHONY: ha-deps
-ha-deps: consul postgres redis harbor-lb minio ## Install all HA dependencies in order (after `make cluster infra-lb`).
+ha-deps: consul postgres redis harbor-lb s3 ## Install all HA dependencies in order (after `make cluster infra-lb`).
 
 .PHONY: consul
 consul: ## Install Consul x3 (DCS for Patroni) on the consul nodes.
@@ -106,16 +106,15 @@ harbor-lb: ## Install the Harbor LB (HAProxy x2) in front of PostgreSQL and Redi
 	@kubectl apply -f hack/ha/00-namespace.yaml -f hack/ha/haproxy.yaml
 	@kubectl -n harbor-deps rollout status deployment/harbor-lb --timeout=180s
 
-.PHONY: minio
-minio: ## Install MinIO on the s3 node + bucket registry-blobs and a scoped user for Harbor.
+.PHONY: s3
+s3: ## Install Garage (S3 stand-in for Ceph RGW) on the s3 node, bucket registry-blobs and a scoped key for Harbor.
 	@kubectl apply -f hack/ha/00-namespace.yaml
-	@kubectl -n harbor-deps get secret minio-credentials >/dev/null 2>&1 || kubectl -n harbor-deps create secret generic minio-credentials \
-	  --from-literal=root-user=minioadmin --from-literal=root-password=$$(openssl rand -hex 16) \
-	  --from-literal=harbor-access-key=harbor --from-literal=harbor-secret-key=$$(openssl rand -hex 16)
-	@kubectl -n harbor-deps delete job minio-init --ignore-not-found >/dev/null
-	@kubectl apply -f hack/ha/minio.yaml
-	@kubectl -n harbor-deps rollout status statefulset/minio --timeout=300s
-	@kubectl -n harbor-deps wait --for=condition=complete job/minio-init --timeout=180s
+	@kubectl -n harbor-deps get secret s3-credentials >/dev/null 2>&1 || kubectl -n harbor-deps create secret generic s3-credentials \
+	  --from-literal=rpc-secret=$$(openssl rand -hex 32) --from-literal=admin-token=$$(openssl rand -hex 16) \
+	  --from-literal=harbor-access-key=GK$$(openssl rand -hex 12) --from-literal=harbor-secret-key=$$(openssl rand -hex 32)
+	@kubectl apply -f hack/ha/s3.yaml
+	@kubectl -n harbor-deps rollout status statefulset/garage --timeout=300s
+	@./hack/ha/s3-init.sh
 
 ##@ Demo app
 

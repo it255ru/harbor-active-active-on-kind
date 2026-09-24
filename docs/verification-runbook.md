@@ -107,7 +107,7 @@ kubectl -n harbor-deps get pods --field-selector=status.phase=Running \
 kubectl -n harbor-deps get pods -o wide
 ```
 
-Ожидается: `consul-*` — 3 разные consul-ноды; `pg-*` — 2 pg-ноды; `redis-*` — 3 redis-ноды; `harbor-lb-*` — 2 lb-ноды; `minio-0` — s3-нода.
+Ожидается: `consul-*` — 3 разные consul-ноды; `pg-*` — 2 pg-ноды; `redis-*` — 3 redis-ноды; `harbor-lb-*` — 2 lb-ноды; `garage-0` — s3-нода.
 
 ## 3. Infra LB
 
@@ -262,30 +262,44 @@ done
 
 Веб-статистика: `kubectl -n harbor-deps port-forward deploy/harbor-lb 8404:8404`, затем http://127.0.0.1:8404/stats.
 
-## 8. MinIO
+## 8. S3 (Garage)
 
-**V8.1 Под на `s3`-ноде, инициализация выполнена**
-
-```bash
-kubectl -n harbor-deps get pod minio-0 -o wide --no-headers | awk '{print $1,$2,$3,$7}'     # Ожидается: 1/1 Running на s3-ноде
-kubectl -n harbor-deps get job minio-init --no-headers                                       # Ожидается: Complete 1/1
-kubectl -n harbor-deps logs job/minio-init | tail -1                                         # Ожидается: init done
-```
-
-**V8.2 Доступ пользователя Harbor только к своему бакету**
+**V8.1 Под на `s3`-ноде, раскладка и бакет**
 
 ```bash
-AK=$(kubectl -n harbor-deps get secret minio-credentials -o jsonpath='{.data.harbor-access-key}' | base64 -d)
-SK=$(kubectl -n harbor-deps get secret minio-credentials -o jsonpath='{.data.harbor-secret-key}' | base64 -d)
-MC=quay.io/minio/mc:RELEASE.2025-08-13T08-35-41Z@sha256:a7fe349ef4bd8521fb8497f55c6042871b2ae640607cf99d9bede5e9bdf11727
-kubectl run v82 --rm -i --restart=Never --image=$MC \
-  --overrides='{"spec":{"nodeSelector":{"harbor-ha/role":"app"},"tolerations":[{"key":"harbor-ha/role","operator":"Equal","value":"app","effect":"NoSchedule"}]}}' \
-  --command -- sh -c "export MC_CONFIG_DIR=/tmp/mc; mc alias set h http://minio.harbor-deps:9000 $AK $SK >/dev/null \
-    && echo probe > /tmp/p && mc cp /tmp/p h/registry-blobs/v82 && mc cat h/registry-blobs/v82 && mc rm h/registry-blobs/v82; \
-    mc mb h/other 2>&1 | tail -1"
+kubectl -n harbor-deps get pod garage-0 -o wide --no-headers | awk '{print $1,$2,$3,$7}'         # Ожидается: 1/1 Running на s3-ноде
+kubectl -n harbor-deps exec garage-0 -- /garage status 2>/dev/null | grep -E 'dc1'               # Ожидается: строка с зоной dc1 и ёмкостью (раскладка применена)
+kubectl -n harbor-deps exec garage-0 -- /garage bucket info registry-blobs 2>/dev/null | grep -E '^(Global alias|Size|Objects)'   # бакет есть
+kubectl -n harbor-deps exec garage-0 -- /garage key info harbor 2>/dev/null | head -8            # ключ harbor: права RWO только на registry-blobs
 ```
 
-Ожидается: запись, чтение (`probe`) и удаление в `registry-blobs` проходят; `mc mb h/other` — `Access Denied`. Тест-под запускается на `app`-ноде (как будет работать Harbor) и удаляется сам (`--rm`).
+В образе Garage нет оболочки: команды `garage` выполняются как `kubectl exec garage-0 -- /garage ...`. Если раскладка или бакет отсутствуют, повторить `make s3` (инициализация идемпотентна).
+
+**V8.2 Доступ ключа Harbor только к своему бакету (обмен данными по S3 API)**
+
+Нужен `aws` CLI на хосте. Конфигурация берётся изолированно (временные файлы), чтобы не читать и не менять `~/.aws`.
+
+```bash
+kubectl -n harbor-deps port-forward svc/s3 13900:3900 >/dev/null 2>&1 & PF=$!; sleep 2
+T=$(mktemp -d); printf '[default]\nregion = us-east-1\n' > $T/cfg
+export AWS_CONFIG_FILE=$T/cfg AWS_SHARED_CREDENTIALS_FILE=/dev/null AWS_ENDPOINT_URL=http://127.0.0.1:13900
+export AWS_ACCESS_KEY_ID=$(kubectl -n harbor-deps get secret s3-credentials -o jsonpath='{.data.harbor-access-key}' | base64 -d)
+export AWS_SECRET_ACCESS_KEY=$(kubectl -n harbor-deps get secret s3-credentials -o jsonpath='{.data.harbor-secret-key}' | base64 -d)
+echo probe > $T/p
+aws --only-show-errors s3 cp $T/p s3://registry-blobs/v82 && aws --only-show-errors s3 cp s3://registry-blobs/v82 - && aws --only-show-errors s3 rm s3://registry-blobs/v82
+aws s3api create-bucket --bucket other 2>&1 | tail -1 | cut -c1-120
+unset AWS_CONFIG_FILE AWS_SHARED_CREDENTIALS_FILE AWS_ENDPOINT_URL AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY; kill $PF; rm -rf $T
+```
+
+Ожидается: запись, чтение (`probe`) и удаление в `registry-blobs` проходят; создание другого бакета — `AccessDenied`.
+
+**V8.3 Незавершённые multipart-загрузки**
+
+```bash
+kubectl -n harbor-deps exec garage-0 -- /garage bucket info registry-blobs 2>/dev/null | grep -E '^(Size|Objects|Unfinished|Size of unfinished)'
+```
+
+Информационная проверка: после обрывов загрузок (H4.2) остаются незавершённые загрузки; они не мешают работе и убираются задачей purge registry (по умолчанию для загрузок старше 168 ч) или сборкой мусора.
 
 ## 9. Доступность из namespace Harbor
 
@@ -305,9 +319,12 @@ kubectl run v91 --rm -i --restart=Never --image=$PGI --overrides="$OV" --env=PGP
 # V9.3 Redis через Harbor LB
 kubectl run v93 --rm -i --restart=Never --image=$VKI --overrides="$OV" --env=REDISCLI_AUTH=$(g redis-credentials password) --command -- \
   sh -c 'valkey-cli -h harbor-lb.harbor-deps set v93 ok && valkey-cli -h harbor-lb.harbor-deps get v93 && valkey-cli -h harbor-lb.harbor-deps del v93'
+
+# V9.4 S3 (Garage): порт открыт из namespace Harbor
+kubectl run v94 --rm -i --restart=Never --image=$PGI --overrides="$OV" --command -- sh -c 'nc -z -w3 s3.harbor-deps.svc.cluster.local 3900 && echo s3-port-open'
 ```
 
-Ожидается: `t` и адрес лидера Consul в кавычках (V9.1–V9.2); `OK`, `ok`, `1` (V9.3). Доступность MinIO из `default` проверяется командой V8.2 (она уже запускается в `default`). Служебные строки `If you don't see a command prompt` и `pod ... deleted` — норма.
+Ожидается: `t` и адрес лидера Consul в кавычках (V9.1–V9.2); `OK`, `ok`, `1` (V9.3); `s3-port-open` (V9.4). Доступность S3 из `default`: команда V9.4 (порт `s3.harbor-deps:3900` открыт); обмен данными по S3 API проверяет V8.2. Служебные строки `If you don't see a command prompt` и `pod ... deleted` — норма.
 
 ## 10. Ресурсы хоста
 
@@ -350,11 +367,11 @@ curl -s http://172.20.0.101:5000/                                               
 
 Чарт: `helm registry login` → `helm package helm-hello-kube` → `helm push ... oci://core.harbor.domain/python/hello --ca-file ca.crt` → `helm pull`/`helm install` из OCI → `helm test hello-kube` (Phase: Succeeded), команды — в README.
 
-**V11.4 Блобы лежат в MinIO, а не в томе**
+**V11.4 Блобы лежат в S3 (Garage), а не в томе**
 
 ```bash
 kubectl get pvc --no-headers | awk '{print $1}'                                          # Ожидается: только data-harbor-trivy-0
-# объекты бакета: mc ls --recursive h/registry-blobs (см. V8.2 для запуска mc); после push должны быть docker/registry/v2/blobs/...
+kubectl -n harbor-deps exec garage-0 -- /garage bucket info registry-blobs 2>/dev/null | grep -E '^(Size|Objects)'   # после push число объектов и размер растут
 ```
 
 **V11.5 Данные Harbor во внешних сервисах**
@@ -447,7 +464,7 @@ for p in $(kubectl get pods -l component=registry -o name); do
 done
 ```
 
-Ожидается: ненулевые PATCH/PUT у обоих подов registry; для core — разбор логов ingress-nginx как в разделе 12 (фильтр путей `/v2/`). В MinIO размер бакета вырастает примерно на объём загруженных слоёв (`mc du h/registry-blobs`, см. V8.2).
+Ожидается: ненулевые PATCH/PUT у обоих подов registry; для core — разбор логов ingress-nginx как в разделе 12 (фильтр путей `/v2/`). В S3 размер бакета вырастает примерно на объём загруженных слоёв (`garage bucket info registry-blobs`, см. V8.1).
 
 Очистка тестовых данных:
 
@@ -457,7 +474,7 @@ curl -sk -u admin:Harbor12345 -X DELETE "https://core.harbor.domain/api/v2.0/pro
 curl -sk -u admin:Harbor12345 -X DELETE "https://core.harbor.domain/api/v2.0/projects/python/repositories/hello%252Fhello-kube/artifacts/0.1.1"
 ```
 
-Удаление артефакта не освобождает блобы в MinIO: место вернёт только сборка мусора registry (GC), в лаборатории она не запускается.
+Удаление артефакта не освобождает блобы в S3: место вернёт только сборка мусора registry (GC), в лаборатории она не запускается.
 
 ### P4.2 Удаление пода registry/core во время push
 
@@ -486,7 +503,7 @@ hack/tests/h42-kill-during-push.sh core core h42-core            # под core (
 
 Если `no active pod detected` — push закончился раньше, чем детектор увидел трафик: проверить ограничение скорости (`tc`) и порог `THRESHOLD`. Если push упал с `unauthorized` — проверить Redis/Sentinel и загрузку хоста (V6.x, V7.2): при недоступном Redis core временно отклоняет авторизацию.
 
-После проверки в MinIO остаются нулевые `_uploads/<uuid>/data` (незавершённые multipart) — штатный мусор S3-драйвера, есть и у пушей без сбоев. Тестовые артефакты удаляются скриптом по digest; блобы в S3 остаются до сборки мусора (GC).
+После проверки в Garage остаются незавершённые multipart-загрузки (`Unfinished uploads` в `garage bucket info`, после двух убийств около 31 МБ) — мусор оборванных загрузок, убирается purge registry/GC. Тестовые артефакты удаляются скриптом по digest; блобы в S3 остаются до сборки мусора (GC).
 
 ### P4.3 Rolling update core и registry во время непрерывных pull
 
@@ -591,7 +608,8 @@ docker pull core.harbor.domain/dockerhub-proxy/library/alpine:3.20
 | Patroni не выбирает лидера | `patronictl ... list`, `logs pg-0`; доступность `consul.harbor-deps:8500`; пароли `pg-credentials` не совпадают с данными на PVC (Secret удалён, PVC остался) |
 | HAProxy: у PG/Redis нет `UP` | V5.2 и V6.1: primary/master есть? `logs deploy/harbor-lb`; после правки конфига HAProxy не перечитывает его сам — поднять аннотацию `config-version` в `hack/ha/haproxy.yaml` |
 | Sentinel: `flags s_down`/`o_down` | `logs redis-N -c sentinel`; резолвинг `redis-N.redis-headless.harbor-deps.svc.cluster.local` |
-| MinIO `Access Denied` у Harbor | `minio-init` не завершился (V8.1); повторить `make minio` |
+| S3 `AccessDenied` у Harbor | ключ `harbor` не создан или не разрешён на бакет (V8.1); повторить `make s3` (идемпотентно); Secret `harbor-ha-s3` берёт ключи из `s3-credentials` только при первом создании |
+| Образ третьего реестра перестал тянуться при пересборке (`401 Unauthorized` на `HEAD .../manifests/sha256:...`) | реестр закрыл репозиторий (так случилось с `quay.io/minio/*`, D4a): закреплённый digest получить негде; нужен другой источник/версия или собственная сборка, решение фиксируется в `backlog.md` |
 | `172.20.0.100` не отвечает | `kubectl get endpoints ingress-nginx-controller` (нет Ready-подов — MetalLB не держит анонс), `kubectl logs -l app.kubernetes.io/component=speaker`, подсеть `kind` (V3.2) |
 | `docker login` → 500, в логах core `unable to get PrivateKey from PEM type: PRIVATE KEY` | Secret `harbor-ha-token` создан с ключом PKCS#8. Удалить его и выполнить `make harbor-ha` (скрипт создаёт PKCS#1), затем `kubectl rollout restart deploy/harbor-core` |
 | Rolling update завис, новый под `Pending`, `didn't satisfy existing pods anti-affinity rules` | обязательный `podAntiAffinity` на двух нодах блокирует surge-под; использовать `topologySpreadConstraints` (как в `harbor-ha.yaml`) или `maxSurge: 0` (как у `harbor-lb`); уже застрявшие Deployment'ы — `scale 0` → `2` |
@@ -642,7 +660,7 @@ ansible/
   verify.yml                # playbook: роли по разделам, теги V1..V10
   group_vars/all.yml        # namespace, LB_IP, ожидаемое число нод по ролям
   roles/verify_cluster/ verify_pods/ verify_infra_lb/ verify_consul/
-        verify_postgres/ verify_redis/ verify_haproxy/ verify_minio/ verify_e2e/ verify_host/
+        verify_postgres/ verify_redis/ verify_haproxy/ verify_s3/ verify_e2e/ verify_host/
 ```
 
 Требуются коллекции `kubernetes.core` (и опционально `community.docker`) и Python-модуль `kubernetes` на управляющей машине. Итог плейбука: сводная таблица «проверка — результат» и ненулевой код возврата при любом отказе, чтобы его можно было запускать по расписанию и в CI. В `backlog.md` это оформлено как H5.4.

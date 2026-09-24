@@ -12,7 +12,7 @@ NS=default
 
 src() { kubectl -n "$DEPS_NS" get secret "$1" -o "jsonpath={.data.$2}" | base64 -d; }
 
-for s in pg-credentials redis-credentials minio-credentials; do
+for s in pg-credentials redis-credentials s3-credentials; do
   kubectl -n "$DEPS_NS" get secret "$s" >/dev/null 2>&1 || { echo "Secret $DEPS_NS/$s not found - run 'make ha-deps' first" >&2; exit 1; }
 done
 
@@ -36,8 +36,8 @@ fi
 if ! kubectl -n "$NS" get secret harbor-ha-s3 >/dev/null 2>&1; then
   echo "==> Creating Secret $NS/harbor-ha-s3"
   kubectl -n "$NS" create secret generic harbor-ha-s3 \
-    --from-literal=REGISTRY_STORAGE_S3_ACCESSKEY="$(src minio-credentials harbor-access-key)" \
-    --from-literal=REGISTRY_STORAGE_S3_SECRETKEY="$(src minio-credentials harbor-secret-key)"
+    --from-literal=REGISTRY_STORAGE_S3_ACCESSKEY="$(src s3-credentials harbor-access-key)" \
+    --from-literal=REGISTRY_STORAGE_S3_SECRETKEY="$(src s3-credentials harbor-secret-key)"
 fi
 
 # Token signing key/cert shared by all core replicas (otherwise the chart generates a new pair on every upgrade).

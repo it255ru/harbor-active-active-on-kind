@@ -2,7 +2,7 @@
 
 Harbor in active-active mode on KinD: several replicas of core, portal, registry and jobservice behind ingress, sharing external PostgreSQL, Redis (Valkey) and S3-compatible object storage, with the goal of surviving the loss of a replica.
 
-**Status:** in progress. Phases 0-3 are done: the 14-node cluster, Infra LB, Consul, PostgreSQL under Patroni, Valkey with Sentinel, HAProxy (Harbor LB), MinIO and Harbor itself (2 replicas each of core, portal, registry and jobservice) are up, and image and OCI chart push/pull work through the full chain (`make cluster infra-lb ha-deps harbor-ha deploy-app`). Milestone 1 (the whole stand working across the 14 nodes) was accepted on 2026-09-24; the failure tests (Phase 4, milestone 2) are next. The plan, design decisions (D1-D10) and acceptance criteria are in [backlog.md](backlog.md) (written in Russian).
+**Status:** in progress. Phases 0-3 are done: the 14-node cluster, Infra LB, Consul, PostgreSQL under Patroni, Valkey with Sentinel, HAProxy (Harbor LB), Garage (S3) and Harbor itself (2 replicas each of core, portal, registry and jobservice) are up, and image and OCI chart push/pull work through the full chain (`make cluster infra-lb ha-deps harbor-ha deploy-app`). Milestone 1 (the whole stand working across the 14 nodes) was accepted on 2026-09-24; the failure tests (Phase 4, milestone 2) are next. The plan, design decisions (D1-D10) and acceptance criteria are in [backlog.md](backlog.md) (written in Russian).
 
 ## Target architecture
 
@@ -15,7 +15,7 @@ Harbor in active-active mode on KinD: several replicas of core, portal, registry
 | pg | 2 | PostgreSQL under Patroni |
 | redis | 3 | Valkey with Sentinel (assumption, D3) |
 | consul | 3 | Consul servers, DCS for Patroni |
-| s3 | 1 | MinIO, stands in for Ceph RGW; registry blobs |
+| s3 | 1 | Garage (S3), stands in for Ceph RGW; registry blobs |
 
 Entry point: ingress-nginx + MetalLB (Infra LB). Backups, Prometheus and Nexus are out of scope.
 
@@ -52,19 +52,18 @@ HA components (installed by `make ha-deps`; image digests are in `backlog.md`):
 | Consul | `1.22.7` |
 | HAProxy | `3.4.4-alpine3.24` |
 | Valkey + Sentinel | `9.0.6-alpine3.24` |
-| MinIO | `RELEASE.2025-09-07T16-13-09Z` |
-| MinIO client `mc` | `RELEASE.2025-08-13T08-35-41Z` |
+| Garage (S3) | `v2.4.1` |
 
 ## Building the stand
 
 ```bash
 make cluster       # 14-node kind cluster "harbor" (hack/config/kind-cluster.yaml), context kind-harbor
 make infra-lb      # MetalLB + ingress-nginx x2 on the lb nodes
-make ha-deps       # consul, postgres, redis, harbor-lb, minio - in this order
+make ha-deps       # consul, postgres, redis, harbor-lb, s3 - in this order
 make cluster-delete
 ```
 
-`make ha-deps` runs these individually runnable targets, and the order matters: `consul` -> `postgres` (Patroni needs Consul) -> `redis` -> `harbor-lb` (HAProxy needs PostgreSQL and Redis backends) -> `minio`. Every target is idempotent.
+`make ha-deps` runs these individually runnable targets, and the order matters: `consul` -> `postgres` (Patroni needs Consul) -> `redis` -> `harbor-lb` (HAProxy needs PostgreSQL and Redis backends) -> `s3`. Every target is idempotent.
 
 Measured from scratch (2026-09-24): `cluster` + `infra-lb` about 7 min, `ha-deps` about 4 min, dominated by image pulls.
 
@@ -94,11 +93,11 @@ Everything HA-related lives in namespace `harbor-deps`; manifests are in `hack/h
 | PostgreSQL x2 + Patroni | `postgres.yaml`, `patroni/` | via HAProxy: `harbor-lb.harbor-deps:5432` (database `registry`, user `harbor`) |
 | Valkey x3 + Sentinel sidecars | `redis.yaml` | via HAProxy: `harbor-lb.harbor-deps:6379` |
 | HAProxy x2 (Harbor LB) | `haproxy.yaml` | `harbor-lb.harbor-deps` (stats: `:8404/stats`) |
-| MinIO | `minio.yaml` | `minio.harbor-deps:9000` (bucket `registry-blobs`) |
+| Garage (S3) | `s3.yaml`, `s3-init.sh` | `s3.harbor-deps:3900` (bucket `registry-blobs`) |
 
 ### Credentials
 
-Passwords are generated with `openssl rand` on the first run of each target and stored only in Secrets in `harbor-deps` (`pg-credentials`, `redis-credentials`, `minio-credentials`); nothing is committed. Read one with, for example:
+Passwords are generated with `openssl rand` on the first run of each target and stored only in Secrets in `harbor-deps` (`pg-credentials`, `redis-credentials`, `s3-credentials`); nothing is committed. Read one with, for example:
 
 ```bash
 kubectl -n harbor-deps get secret pg-credentials -o jsonpath='{.data.harbor}' | base64 -d
@@ -137,7 +136,8 @@ curl -s -o /dev/null -w '%{http_code}\n' http://172.20.0.100/                   
 - **The PostgreSQL+Patroni image is built locally** (`make pg-image`, run by `make postgres`) and loaded with `kind load` into the two `pg` nodes only (`imagePullPolicy: Never`). It disappears with the cluster; `make postgres` rebuilds it. It needs Docker Hub and PyPI access at build time.
 - **HAProxy does not reload on config change.** After editing `haproxy-config` in `hack/ha/haproxy.yaml`, bump the `config-version` pod annotation so the Deployment rolls.
 - **Kubernetes does not expand `$(HOSTNAME)`** in `args`; use the downward API (`POD_NAME`) as `consul.yaml` does. Three Consul servers sharing one node name never form a quorum.
-- **MinIO** is a single node with a single drive (no erasure coding) and the community edition is no longer maintained; it stands in for Ceph RGW only.
+- **The S3 store is Garage**, a single node with one drive (no replication), standing in for Ceph RGW. It replaced MinIO because MinIO's images on quay.io became private (`401`) and are not on Docker Hub, so the pinned image could not be pulled during a rebuild (D4a). The Garage image has no shell: `hack/ha/s3-init.sh` runs the `garage` CLI through `kubectl exec`.
+- **Third-party images can disappear.** Every image is pinned by digest, but that does not help when the registry withdraws the repository. A rebuild from scratch is what finds this; keep it in mind before deleting the cluster.
 - **Consul has no ACL/TLS, Redis Sentinel has no password, PostgreSQL replication is asynchronous** - deliberate for the lab (backlog D8).
 - Failure behaviour (Patroni failover, Sentinel failover, losing an HAProxy) has **not** been tested yet: those checks belong to milestone 2 (Phase 4) and count only after milestone 1 is accepted.
 

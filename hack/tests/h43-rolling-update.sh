@@ -6,7 +6,7 @@
 #
 # Load (all through the Infra LB, deliberately light: the lab shares one host disk):
 #   manifest : GET /v2/python/hello/manifests/1.0            every ~0.1 s   (core -> registry -> S3)
-#   blob     : GET the biggest layer of python/hello:1.0     every ~0.4 s   (13 MB, streamed by registry from MinIO)
+#   blob     : GET the biggest layer of python/hello:1.0     every ~0.4 s   (13 MB, streamed by registry from S3)
 #   pull     : docker rmi + docker pull python/hello:1.0     back to back   (real client with its own retries)
 # curl does NOT retry, so every error the load generators log is an error a client would have seen.
 # Each component gets `kubectl rollout restart` and we wait for `rollout status`; the load keeps running

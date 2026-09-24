@@ -86,7 +86,27 @@ check "$([ "$(curl "${A[@]}" "$API/projects/$PROJ" | python3 -c "import sys,json
 
 echo "== 2. cold pull of $CACHED through Harbor (fetched from Docker Hub, then cached)"
 REF=$HOST/$PROJ/$CACHED; REPO=${CACHED%%:*}; TAGN=${CACHED##*:}; REPOURL=${REPO//\//%252F}
-s=$(date +%s.%N); OUT=$(pull "$REF"); D=$(echo "$OUT" | digest_of); echo "   $(secs $s)s  digest $D"
+# The cold pull is done with curl (index -> platform manifest -> config and layers), not with `docker pull`:
+# docker keeps layers in its own content store after `rmi`, so a later docker pull would fetch only manifests
+# and never ask Harbor for the blobs, and Harbor caches an artifact only once its blobs have been requested.
+s=$(date +%s.%N)
+ACC_IDX="application/vnd.oci.image.index.v1+json,application/vnd.docker.distribution.manifest.list.v2+json"
+ACC_MAN="application/vnd.oci.image.manifest.v1+json,application/vnd.docker.distribution.manifest.v2+json"
+curl "${A[@]}" -D "$W/idx.h" -o "$W/idx.json" -H "Accept: $ACC_IDX" "$HOST_URL/v2/$PROJ/$REPO/manifests/$TAGN"
+# a manifest digest is the sha256 of its bytes (Harbor's proxy response carries no Docker-Content-Digest header)
+D="sha256:$(sha256sum "$W/idx.json" | cut -d' ' -f1)"; [ -s "$W/idx.json" ] || D="" 
+PLAT=$(python3 -c "
+import json
+d = json.load(open('$W/idx.json'))
+print(next((m['digest'] for m in d.get('manifests', []) if m.get('platform', {}).get('os') == 'linux' and m.get('platform', {}).get('architecture') == 'amd64'), ''))" 2>/dev/null)
+curl "${A[@]}" -o "$W/plat.json" -H "Accept: $ACC_MAN" "$HOST_URL/v2/$PROJ/$REPO/manifests/$PLAT"
+for BD in $(python3 -c "
+import json
+d = json.load(open('$W/plat.json'))
+print(' '.join([d['config']['digest']] + [l['digest'] for l in d['layers']]))" 2>/dev/null); do
+  curl "${A[@]}" -o /dev/null "$HOST_URL/v2/$PROJ/$REPO/blobs/$BD"
+done
+echo "   $(secs $s)s  index $D  platform $PLAT"
 TOKEN=$(curl -s "https://auth.docker.io/token?service=registry.docker.io&scope=repository:$REPO:pull" | python3 -c "import sys,json; print(json.load(sys.stdin)['token'])")
 UP=$(curl -sI -H "Authorization: Bearer $TOKEN" -H "Accept: application/vnd.oci.image.index.v1+json,application/vnd.docker.distribution.manifest.list.v2+json" "https://registry-1.docker.io/v2/$REPO/manifests/$TAGN" | tr -d '\r' | awk -F': ' 'tolower($1)=="docker-content-digest"{print $2}')
 check "$(same "$D" "$UP" && echo ok || echo bad)" "digest through Harbor equals the digest on Docker Hub ($UP)"

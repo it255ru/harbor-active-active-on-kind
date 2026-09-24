@@ -47,7 +47,7 @@ flowchart TB
     end
 
     subgraph s3n["S3: роль s3, 1 нода"]
-        minio["MinIO<br/>бакет registry-blobs"]
+        minio["Garage (S3)<br/>бакет registry-blobs"]
     end
 
     client --> metallb --> ingress
@@ -88,13 +88,13 @@ flowchart TB
 | `harbor-worker10` | `consul` | 172.20.0.9 | `consul-0` |
 | `harbor-worker11` | `consul` | 172.20.0.11 | `consul-1` |
 | `harbor-worker12` | `consul` | 172.20.0.4 | `consul-2` |
-| `harbor-worker13` | `s3` | 172.20.0.12 | `minio-0` |
+| `harbor-worker13` | `s3` | 172.20.0.12 | `garage-0` |
 
 Колонка «Что на ней работает» — снимок: какой именно под (`pg-N`, `redis-N`, `consul-N`) на какой ноде оказался, зависит от порядка запуска; смотреть `kubectl get pods -A -o wide`. Правило постоянно: по одному поду роли на ноду, роль и нода соответствуют. Лидер PostgreSQL и master Redis тоже могут быть на любой из своих нод.
 
 Актуальные IP нод: `kubectl get nodes -o wide` или `docker network inspect kind`.
 
-Соответствие боевой схеме (по таблице узлов из `backlog.md`): `app` = `hb-app-01/02`, `lb` = `hb-lb-01/02`, `pg` = `hb-pg-01/02`, `redis` = `hb-redis-01..03`; Consul и MinIO (замена Ceph RGW) вынесены на собственные ноды по решению D1.
+Соответствие боевой схеме (по таблице узлов из `backlog.md`): `app` = `hb-app-01/02`, `lb` = `hb-lb-01/02`, `pg` = `hb-pg-01/02`, `redis` = `hb-redis-01..03`; Consul и Garage (замена Ceph RGW; до D4a — MinIO) вынесены на собственные ноды по решению D1.
 
 ## Сети и внешние адреса
 
@@ -129,9 +129,9 @@ flowchart TB
 | Redis / Valkey | `redis-{0,1,2}.redis-headless.harbor-deps`:6379 | HAProxy, Sentinel | `redis-0..2` (`redis`) |
 | Redis Sentinel | `redis-{0,1,2}.redis-headless.harbor-deps`:26379, мастер-сет `mymaster`, кворум 2 | Valkey, оператор | sidecar в тех же подах |
 | Consul | `consul.harbor-deps`:8500 (клиентский), `consul-headless` :8300/8301/8600 | Patroni | `consul-0..2` (`consul`) |
-| MinIO (S3) | `minio.harbor-deps`:9000 (S3), :9001 (консоль) | registry | `minio-0` (`s3`) |
+| Garage (S3) | `s3.harbor-deps`:3900 (S3 API; RPC :3901 и admin :3903 наружу не открыты) | registry | `garage-0` (`s3`) |
 
-Что и куда подключается в конфигурации Harbor (`hack/config/harbor-ha.yaml`): БД `registry`, пользователь `harbor`, хост `harbor-lb.harbor-deps.svc.cluster.local:5432`; Redis `harbor-lb.harbor-deps.svc.cluster.local:6379`, режим `redis` (не sentinel); S3 `http://minio.harbor-deps.svc.cluster.local:9000`, бакет `registry-blobs`, регион `us-east-1`.
+Что и куда подключается в конфигурации Harbor (`hack/config/harbor-ha.yaml`): БД `registry`, пользователь `harbor`, хост `harbor-lb.harbor-deps.svc.cluster.local:5432`; Redis `harbor-lb.harbor-deps.svc.cluster.local:6379`, режим `redis` (не sentinel); S3 `http://s3.harbor-deps.svc.cluster.local:3900`, бакет `registry-blobs`, регион `us-east-1`.
 
 Логика HAProxy (`hack/ha/haproxy.yaml`):
 
@@ -146,7 +146,7 @@ flowchart TB
 
 | Данные | Где | Размер | Заметка |
 |--------|-----|--------|---------|
-| Блобы образов и чартов | MinIO, бакет `registry-blobs`, PVC `data-minio-0` | 10 ГБ | не в томе registry: у registry PVC нет |
+| Блобы образов и чартов | Garage, бакет `registry-blobs`, PVC `data-garage-0` | 10 ГБ | не в томе registry: у registry PVC нет |
 | Метаданные Harbor | PostgreSQL, БД `registry`, PVC `data-pg-0/1` | 5 ГБ на под | асинхронная репликация |
 | Кэш, очереди, сессии | Valkey, PVC `data-redis-0..2` | 1 ГБ на под | `appendonly yes`; индексы БД Harbor: 0 core, 1 jobservice, 2 registry, 5 trivy |
 | Состояние кластера Patroni | Consul, PVC `data-consul-0..2` | 1 ГБ на под | ключи `service/harbor-pg/*` |
@@ -161,7 +161,7 @@ flowchart TB
 |--------|-----------|------------|-----------|
 | `pg-credentials` | `harbor-deps` | пароли `superuser`, `replication`, `harbor` (роль БД Harbor) | `make postgres` |
 | `redis-credentials` | `harbor-deps` | пароль Redis | `make redis` |
-| `minio-credentials` | `harbor-deps` | root-пользователь MinIO; `harbor-access-key`/`harbor-secret-key` (пользователь `harbor` только на бакет) | `make minio` |
+| `s3-credentials` | `harbor-deps` | секрет RPC и токен admin Garage; ключ доступа Harbor (`harbor-access-key` вида `GK…`, `harbor-secret-key`), права только на бакет `registry-blobs` | `make s3` |
 | `harbor-ha-secrets` | `default` | пароль БД и Redis для Harbor, `secret`, `CSRF_KEY`, `JOBSERVICE_SECRET`, `REGISTRY_HTTP_SECRET`, `secretKey` | `make harbor-ha` |
 | `harbor-ha-s3` | `default` | S3-ключи для registry | `make harbor-ha` |
 | `harbor-ha-ingress-tls` | `default` | CA (`ca.crt`) и сертификат ingress для `core.harbor.domain` (`tls.crt`, `tls.key`), 10 лет; CA стабилен между `helm upgrade` | `make harbor-ha` |

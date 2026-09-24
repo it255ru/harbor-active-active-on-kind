@@ -2,7 +2,7 @@
 
 Repo: **harbor-active-active-on-kind**. Goal: run **Harbor in active-active (HA) mode** on KinD — several replicas of core/portal/registry/jobservice (maybe trivy) behind ingress, sharing external PostgreSQL, Redis (Valkey) and S3-compatible object storage — and prove it survives losing a replica.
 
-**Provenance:** started 2026-09-24 as a copy of `harbor-on-kind` @ `b65df71` (full git history kept; not a GitHub fork, since GitHub forbids same-owner forks). Original single-node lab: https://github.com/it255ru/harbor-on-kind. Everything under "Baseline" below is verified-working *single-node* behavior inherited from there. **HA work status:** Phases 0–3 done (14-node cluster, Infra LB, Consul, Patroni/PostgreSQL, Valkey/Sentinel, HAProxy, MinIO, Harbor in HA, deploy-app and OCI push/pull working); milestone 1 (H3.5) was accepted by the user on 2026-09-24; Phase 4 (milestone 2, failure tests) is next and now counts — the plan and decisions are in `backlog.md` (written in Russian, source of truth).
+**Provenance:** started 2026-09-24 as a copy of `harbor-on-kind` @ `b65df71` (full git history kept; not a GitHub fork, since GitHub forbids same-owner forks). Original single-node lab: https://github.com/it255ru/harbor-on-kind. Everything under "Baseline" below is verified-working *single-node* behavior inherited from there. **HA work status:** Phases 0–3 done (14-node cluster, Infra LB, Consul, Patroni/PostgreSQL, Valkey/Sentinel, HAProxy, Garage S3, Harbor in HA, deploy-app and OCI push/pull working); milestone 1 (H3.5) was accepted by the user on 2026-09-24; Phase 4 (milestone 2, failure tests) is next and now counts — the plan and decisions are in `backlog.md` (written in Russian, source of truth).
 
 See also: `AGENTS.md` (agent orientation), `README.md` (status, requirements and command list; Harbor HA sections get added as Phase 3 lands).
 
@@ -10,10 +10,10 @@ See also: `AGENTS.md` (agent orientation), `README.md` (status, requirements and
 
 Rules:
 - Work `backlog.md` phases in order; tick `- [ ]` → `- [x]` as items finish.
-- No design decisions are open (all settled 2026-09-24, see `backlog.md` "Решения и открытые вопросы"): D1 14 nodes (1 control-plane + app×2, lb×2, pg×2, redis×3, consul×3, s3×1), D2 Patroni + Consul, D3 Redis Sentinel (an *assumption* — prod mode unknown), D4 S3/MinIO, D5 one lab cluster at a time, D7 HAProxy as Harbor LB, D8 minimum scope, D9/D10 colors ignored and Nexus out of scope. Ask if a new decision appears — don't pick silently.
+- No design decisions are open (all settled 2026-09-24, see `backlog.md` "Решения и открытые вопросы"): D1 14 nodes (1 control-plane + app×2, lb×2, pg×2, redis×3, consul×3, s3×1), D2 Patroni + Consul, D3 Redis Sentinel (an *assumption* — prod mode unknown), D4 S3 (Garage since D4a; MinIO's images became private), D5 one lab cluster at a time, D7 HAProxy as Harbor LB, D8 minimum scope, D9/D10 colors ignored and Nexus out of scope. Ask if a new decision appears — don't pick silently.
 - **Success is two-staged (D6):** first *milestone 1* — the whole stand works with correct distribution over the 14 nodes (roles, placement, healthy Consul/Patroni/Redis, end-to-end push/pull via the full chain, both app replicas serving); only after it passes do the Phase 4 failure tests (*milestone 2*) count. Milestone 1 (`H3.5`) is accepted (2026-09-24), so Phase 4 results now count.
-- **Target architecture** is described in `backlog.md` → "Целевая архитектура" (from the user's diagrams): Harbor app ×2 → Harbor LB ×2 (HAProxy) → PostgreSQL ×2 under Patroni with state in Consul ×3, + Redis ×3 (assumed Sentinel); blobs in S3 (Ceph in prod, MinIO stand-in here, own node); Infra LB (shared entry, ingress-nginx + MetalLB here) in front. Backups, Prometheus and Nexus appear on the diagram but are **out of scope** (D8, D10). Note `hb-lb` balances PG/Redis, it is **not** the Harbor ingress.
-- Don't invent versions. Every new component (PostgreSQL, Redis/Valkey, MinIO, any operator) gets an explicit pinned version recorded in `backlog.md` and the table below **before** it is installed.
+- **Target architecture** is described in `backlog.md` → "Целевая архитектура" (from the user's diagrams): Harbor app ×2 → Harbor LB ×2 (HAProxy) → PostgreSQL ×2 under Patroni with state in Consul ×3, + Redis ×3 (assumed Sentinel); blobs in S3 (Ceph in prod, Garage stand-in here, own node); Infra LB (shared entry, ingress-nginx + MetalLB here) in front. Backups, Prometheus and Nexus appear on the diagram but are **out of scope** (D8, D10). Note `hb-lb` balances PG/Redis, it is **not** the Harbor ingress.
+- Don't invent versions. Every new component (PostgreSQL, Redis/Valkey, the S3 store, any operator) gets an explicit pinned version recorded in `backlog.md` and the table below **before** it is installed.
 - Verify Harbor chart keys against `helm show values harbor/harbor --version 1.19.2`, not memory.
 - **One lab cluster at a time (decided 2026-09-24, D5):** `Makefile` deliberately keeps the same defaults as `harbor-on-kind` (`CLUSTER=harbor`, `LB_IP=172.20.0.100`, pool `172.20.0.100–110`) — only one of the two repos' clusters runs at a time, so they can't clash. Before `make cluster` here, `make cluster-delete` the other repo's cluster. The host's `/etc/hosts` entry and Docker `insecure-registries` for `core.harbor.domain` are reused as-is. If HA needs more LB IPs, widen the pool inside the same subnet and update all coupled files (see "Changing the LB IP").
 - Keep the single-node baseline working until HA replaces it deliberately; if something breaks it, say so.
@@ -37,8 +37,7 @@ HA component pins (H0.1, 2026-09-24; images also pinned by digest — full refs 
 | Consul | `1.22.7` (not 2.0.x) |
 | HAProxy | `3.4.4-alpine3.24` (current LTS) |
 | Valkey + Sentinel | `9.0.6-alpine3.24` (Harbor bundles 9.0.3) |
-| MinIO | `RELEASE.2025-09-07T16-13-09Z` (quay.io; community edition unmaintained) |
-| MinIO client `mc` | `RELEASE.2025-08-13T08-35-41Z` (quay.io; one-shot bucket/user init Job) |
+| Garage (S3) | `v2.4.1` (Docker Hub `dxflrs/garage`; replaced MinIO — its quay.io images became private, D4a) |
 
 Chart `1.19.2` HA-relevant keys (checked against its default values): `database.type: external` + `database.external.*`; `redis.type: external` + `redis.external.*` (bundled Redis in 2.15.2 is Valkey); `persistence.imageChartStorage.type: s3` (`disableredirect: true` for MinIO, `caBundleSecretName` for a self-signed store); `replicas` under `core`, `portal`, `registry`, `jobservice`, `trivy` (all `1` by default).
 
@@ -55,13 +54,13 @@ make help            # list targets
 make cluster         # installs ./bin/kind via `go install` if missing, creates the 14-node cluster "harbor" from hack/config/kind-cluster.yaml (context kind-harbor)
 make add-host        # appends "$LB_IP $HARBOR_HOST" to /etc/hosts (uses sudo)
 make infra-lb        # hack/install-infra.sh: MetalLB → IPAddressPool → ingress-nginx, both on the `lb` nodes (tolerate the role taint)
-make ha-deps        # consul → postgres → redis → harbor-lb → minio in order (after `make cluster infra-lb`); the targets below can also be run individually
+make ha-deps        # consul → postgres → redis → harbor-lb → s3 in order (after `make cluster infra-lb`); the targets below can also be run individually
 make consul          # hack/ha/consul.yaml: Consul x3 StatefulSet in namespace harbor-deps on the consul nodes (DCS for Patroni)
 make pg-image        # build hack/ha/patroni (PostgreSQL 18.6 + Patroni 4.1.5) and `kind load` it into the pg nodes
 make postgres        # pg-image + hack/ha/postgres.yaml: PostgreSQL x2 under Patroni, Secret pg-credentials generated on first run (needs `make consul`)
 make redis           # hack/ha/redis.yaml: Valkey x3 + Sentinel sidecars on the redis nodes, Secret redis-credentials generated on first run
 make harbor-lb       # hack/ha/haproxy.yaml: HAProxy x2 on the lb nodes; Service harbor-lb.harbor-deps :5432 (PG primary via Patroni /primary) and :6379 (Redis master)
-make minio           # hack/ha/minio.yaml: MinIO on the s3 node + bucket registry-blobs + scoped user for Harbor (Secret minio-credentials generated on first run)
+make s3              # hack/ha/s3.yaml + s3-init.sh: Garage (S3) on the s3 node, bucket registry-blobs, scoped key for Harbor (Secret s3-credentials generated on first run; the image has no shell, the init runs `garage` via kubectl exec)
 make harbor-ha       # hack/install-harbor-ha.sh: creates Secrets harbor-ha-secrets/-s3/-token in `default` once, then helm-installs Harbor 1.19.2 with hack/config/harbor-ha.yaml (DRY_RUN=1 = server-side dry run only; needs infra-lb + ha-deps)
 make install         # hack/install.sh: infra-lb, then harbor-ha (the old single-node values hack/config/harbor.yaml are no longer used)
 make deploy-app      # hack/deploy-app.sh: project `python` → docker login/build/push → node CA trust → pull secret → kubectl apply + rollout restart (run after `install`; idempotent)
@@ -89,6 +88,8 @@ Gotchas:
 - Node-loss test (`hack/tests/h44-node-loss.sh`) kills a node container with `docker kill` and restarts it with `docker start`; killing an `app` node leaves replacement pods `Pending` (topology spread, expected) and trivy unavailable until the node returns. It always brings the node back at the end — if it is interrupted, run `docker start <node>` manually.
 - H4.6 (proxy-cache): `hack/tests/h46-proxy-cache.sh` temporarily makes Docker Hub unreachable by editing the CoreDNS Corefile (NXDOMAIN for docker.io/docker.com) and restarts CoreDNS; it restores the original on exit. If it is killed, restore with `kubectl -n kube-system get cm coredns` (the original Corefile has no `template` block) and `kubectl -n kube-system rollout restart deploy/coredns`. Use a fresh proxy project name per run: deleting through the API leaves blobs in S3 and a same-name project then looks empty. Cached content is addressed by digest; tag pulls need the upstream.
 - Harbor's chart has no `preStop`: without it rolling updates of registry/core give client-visible 502s. `hack/helm-postrender.py` (Helm `--post-renderer` in `install-harbor-ha.sh`, needs PyYAML) adds `preStop: sleep 15` to core/registry/portal — keep it when changing the install path.
+- Third-party images can vanish: MinIO's quay.io images became private and the pinned digest could not be pulled during the from-scratch rebuild (D4a → Garage). Before deleting the cluster, remember that a rebuild pulls everything again.
+- AWS CLI on the host: never run `aws configure set` (it writes to the user's `~/.aws/config`); for S3 checks use an isolated `AWS_CONFIG_FILE`/`AWS_SHARED_CREDENTIALS_FILE` (see runbook V8.2).
 - One host disk under everything: large writes (gigabyte pushes, `dd` image builds) stall etcd/apiserver, crash controller-manager/scheduler (leader election) and trigger Sentinel failovers. Keep failure-test data small (`hack/tests/h42-kill-during-push.sh` defaults: 2 x 200 MB, throttled with tc) and wait for the load to settle. Leader-election flags are in `kind-cluster.yaml` (verified on a throwaway single-node cluster; a full stand rebuild is H5.3); Sentinel `down-after-milliseconds` is 15000.
 - Delete Harbor test artifacts by **digest**, never by tag: deleting an artifact removes all its tags (a test tag on `python/hello:1.0`'s digest deleted the demo image once).
 - Cold-start image pulls fail transiently (`ErrImagePull`); pods self-heal, don't rebuild the cluster.
