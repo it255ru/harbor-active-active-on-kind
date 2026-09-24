@@ -459,6 +459,35 @@ curl -sk -u admin:Harbor12345 -X DELETE "https://core.harbor.domain/api/v2.0/pro
 
 Удаление артефакта не освобождает блобы в MinIO: место вернёт только сборка мусора registry (GC), в лаборатории она не запускается.
 
+### P4.2 Удаление пода registry/core во время push
+
+Разрушающая проверка: убивается под, который прямо сейчас принимает загрузку. Скрипт `hack/tests/h42-kill-during-push.sh` делает всё сам (сборка образа, ограничение скорости, поиск активного пода, убийство, сравнение digest, очистка по digest).
+
+```bash
+hack/tests/h42-kill-during-push.sh registry registry h42-reg      # под registry (контейнер registry)
+hack/tests/h42-kill-during-push.sh core core h42-core            # под core (контейнер core)
+# необязательно: LAYERS=2 SIZE_MB=200 RATE=80mbit THRESHOLD=2000000
+```
+
+Условия и предосторожности:
+
+- Все реплики должны быть в норме до запуска (`kubectl get deploy harbor-core harbor-registry`: `2/2`) и загрузка хоста низкой (`cut -d' ' -f1 /proc/loadavg` меньше 3; скрипт ждёт этого сам).
+- Не увеличивать объём данных: гигабайты записи на общий диск ломают control-plane и Sentinel (см. «Диагностика»). Значения по умолчанию (2 слоя по 200 МБ) проверены.
+- Ограничение скорости (`tc`, 80 Мбит/с на исходящем трафике `harbor-worker` и `harbor-worker2`) нужно, чтобы загрузка длилась около двух минут: на localhost без него 1–4 ГБ уходят за секунды. Скрипт снимает ограничение при любом выходе; проверить вручную: `docker exec harbor-worker tc qdisc show dev eth0` должно вернуть `noqueue`.
+- Активный под определяется по росту счётчика `eth0 rx` (`grep eth0 /proc/net/dev`, в контейнерах registry нет `awk`, разбор на стороне хоста).
+
+Ожидается:
+
+- Скрипт печатает `active pod: <под>` и `FORCE DELETE <под>`.
+- `docker push` завершается с `exit=0` и `digest: sha256:...`, в выводе клиента есть строки `Retrying in N s` (клиент повторил загрузку слоя после 502).
+- В сводке кодов ingress-nginx: небольшое число `PATCH 502` в момент убийства, затем успешные `PATCH 202` и `PUT 201`.
+- В конце `pull back` возвращает тот же digest, что и push (целостность).
+- Убитая реплика пересоздана (`kubectl get pods -l component=registry` или `core`: `2/2 Running`, Deployment `2/2`).
+
+Если `no active pod detected` — push закончился раньше, чем детектор увидел трафик: проверить ограничение скорости (`tc`) и порог `THRESHOLD`. Если push упал с `unauthorized` — проверить Redis/Sentinel и загрузку хоста (V6.x, V7.2): при недоступном Redis core временно отклоняет авторизацию.
+
+После проверки в MinIO остаются нулевые `_uploads/<uuid>/data` (незавершённые multipart) — штатный мусор S3-драйвера, есть и у пушей без сбоев. Тестовые артефакты удаляются скриптом по digest; блобы в S3 остаются до сборки мусора (GC).
+
 ## Диагностика
 
 | Симптом | Куда смотреть |
@@ -473,6 +502,9 @@ curl -sk -u admin:Harbor12345 -X DELETE "https://core.harbor.domain/api/v2.0/pro
 | `172.20.0.100` не отвечает | `kubectl get endpoints ingress-nginx-controller` (нет Ready-подов — MetalLB не держит анонс), `kubectl logs -l app.kubernetes.io/component=speaker`, подсеть `kind` (V3.2) |
 | `docker login` → 500, в логах core `unable to get PrivateKey from PEM type: PRIVATE KEY` | Secret `harbor-ha-token` создан с ключом PKCS#8. Удалить его и выполнить `make harbor-ha` (скрипт создаёт PKCS#1), затем `kubectl rollout restart deploy/harbor-core` |
 | Rolling update завис, новый под `Pending`, `didn't satisfy existing pods anti-affinity rules` | обязательный `podAntiAffinity` на двух нодах блокирует surge-под; использовать `topologySpreadConstraints` (как в `harbor-ha.yaml`) или `maxSurge: 0` (как у `harbor-lb`); уже застрявшие Deployment'ы — `scale 0` → `2` |
+| control-plane: `kube-controller-manager`/`kube-scheduler` в `CrashLoopBackOff`, поды не пересоздаются | лог `leaderelection lost`/`context deadline exceeded` — перегрузка общего диска (load average > 10, `iotop`); подождать спада нагрузки (компоненты поднимаются сами), не запускать тяжёлые push/сборки; тайминги leader-election заданы в `kind-cluster.yaml` (lease 60 s) |
+| Sentinel часто переключает master, в логах Valkey `AOF fsync is taking too long` | перегрузка диска; `down-after-milliseconds` = 15000 (`SENTINEL SET mymaster down-after-milliseconds 15000` на всех трёх Sentinel); HAProxy сам находит нового master, смотреть V6.1/V7.2 |
+| После очистки пропал `hello:1.0` | артефакт удалён вместе с чужим тегом на том же digest; `make deploy-app` (тот же digest); удалять тестовые артефакты по digest, не по тегу |
 | Сбросить один компонент | удалить его Secret **и** PVC (`data-<имя>-N`), затем `make <таргет>`; удалять только Secret нельзя: новый пароль не совпадёт с данными |
 | Всё сломалось | `make cluster-delete && make cluster && make infra-lb && make ha-deps` (около 11 минут) |
 

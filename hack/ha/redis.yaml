@@ -51,7 +51,9 @@ data:
     sentinel announce-ip $SELF
     sentinel monitor mymaster $MASTER 6379 2
     sentinel auth-pass mymaster $REDIS_PASSWORD
-    sentinel down-after-milliseconds mymaster 5000
+    # 15 s, not the default 30 s and not 5 s: on this single-host lab a busy shared disk stalls Valkey for
+    # several seconds, and 5 s made Sentinel fail over repeatedly under load (H4.2)
+    sentinel down-after-milliseconds mymaster 15000
     sentinel failover-timeout mymaster 30000
     sentinel parallel-syncs mymaster 1
     CFG
