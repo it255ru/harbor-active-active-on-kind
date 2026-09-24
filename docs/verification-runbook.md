@@ -488,6 +488,24 @@ hack/tests/h42-kill-during-push.sh core core h42-core            # под core (
 
 После проверки в MinIO остаются нулевые `_uploads/<uuid>/data` (незавершённые multipart) — штатный мусор S3-драйвера, есть и у пушей без сбоев. Тестовые артефакты удаляются скриптом по digest; блобы в S3 остаются до сборки мусора (GC).
 
+### P4.3 Rolling update core и registry во время непрерывных pull
+
+Проверяет, что обновление реплик не даёт ошибок клиентам. Не разрушает данные; кратковременно заменяет поды core и registry по очереди.
+
+```bash
+hack/tests/h43-rolling-update.sh              # core, затем registry (по умолчанию)
+hack/tests/h43-rolling-update.sh registry     # только registry
+# необязательно: WORKDIR=<каталог для логов> HARBOR_AUTH=admin:Harbor12345
+```
+
+Что делает: запускает через Infra LB три нагрузки (запрос манифеста каждые ~0,1 с; скачивание блоба 13 МБ каждые ~0,4 с; `docker rmi` + `docker pull` подряд), выполняет `kubectl rollout restart` и `rollout status` для каждого компонента, держит нагрузку до и после и печатает разбор по фазам (`baseline`, `rollout-core`, `after-core`, `rollout-registry`, ...). curl не повторяет запросы, то есть каждая ошибка в логе — это ошибка, которую увидел бы клиент; у `docker pull` есть собственные повторы клиента.
+
+Ожидается: в каждой фазе `errors=0` у `manifest` и `blob`, `failed=0` у `docker pull`, самый медленный запрос порядка долей секунды (в приёмке 0,3–0,5 с). Один прогон длится около минуты; для статистики повторить несколько раз (в H4.3 — 4 прогона до исправления и 4 после).
+
+Перед запуском: все реплики `2/2`, загрузка хоста низкая. Нагрузка лёгкая намеренно (общий диск, см. P4.2).
+
+Если появляются `502` (`http=502`) или паузы около 5 с: смотреть логи core на `proxy error: ... connection refused` и проверить наличие `preStop` (строка в «Диагностике»); `preStop: sleep 15` добавляет `hack/helm-postrender.py` при `make harbor-ha`.
+
 ## Диагностика
 
 | Симптом | Куда смотреть |
@@ -505,6 +523,7 @@ hack/tests/h42-kill-during-push.sh core core h42-core            # под core (
 | control-plane: `kube-controller-manager`/`kube-scheduler` в `CrashLoopBackOff`, поды не пересоздаются | лог `leaderelection lost`/`context deadline exceeded` — перегрузка общего диска (load average > 10, `iotop`); подождать спада нагрузки (компоненты поднимаются сами), не запускать тяжёлые push/сборки; тайминги leader-election заданы в `kind-cluster.yaml` (lease 60 s) |
 | Sentinel часто переключает master, в логах Valkey `AOF fsync is taking too long` | перегрузка диска; `down-after-milliseconds` = 15000 (`SENTINEL SET mymaster down-after-milliseconds 15000` на всех трёх Sentinel); HAProxy сам находит нового master, смотреть V6.1/V7.2 |
 | После очистки пропал `hello:1.0` | артефакт удалён вместе с чужим тегом на том же digest; `make deploy-app` (тот же digest); удалять тестовые артефакты по digest, не по тегу |
+| При rolling update клиенты получают 502, в логах core `proxy error: dial tcp <ClusterIP registry>:5000: connect: connection refused` | под останавливается раньше, чем маршрутизация убрала его; проверить `preStop` у core/registry/portal (`kubectl get deploy harbor-registry -o jsonpath='{.spec.template.spec.containers[*].lifecycle}'`); `preStop` добавляет `hack/helm-postrender.py` при `make harbor-ha` (нужен PyYAML) |
 | Сбросить один компонент | удалить его Secret **и** PVC (`data-<имя>-N`), затем `make <таргет>`; удалять только Secret нельзя: новый пароль не совпадёт с данными |
 | Всё сломалось | `make cluster-delete && make cluster && make infra-lb && make ha-deps` (около 11 минут) |
 

@@ -23,7 +23,7 @@ Success is two-staged: first the whole stand works across the 14 nodes (mileston
 
 ## Requirements
 
-- Linux host with Docker, Go, `kubectl`, `helm` 3.x and `openssl` (`kubectl` within one minor version of the pinned Kubernetes)
+- Linux host with Docker, Go, `kubectl`, `helm` 3.x, `openssl` and `python3` with PyYAML (used by the Helm post-renderer) (`kubectl` within one minor version of the pinned Kubernetes)
 - Host inotify limits raised for 14 nodes: `fs.inotify.max_user_instances=2048`, `fs.inotify.max_user_watches=1048576` (persist in `/etc/sysctl.d/`; needs `sudo`, not managed by this repo)
 - Resources: with Phases 0-2 up (no Harbor yet) the 14 node containers use about 4 GiB RAM; the full stand with Harbor is estimated at 12-13 GiB (not yet measured). Docker images take about 8 GB of disk.
 - Internet access to Docker Hub and quay.io; every node pulls the images of its own role
@@ -127,6 +127,7 @@ curl -s -o /dev/null -w '%{http_code}\n' http://172.20.0.100/                   
 - **jobservice restarts 2-3 times on first start** (core is not accepting connections yet) and then runs normally.
 - **The demo app runs on the control-plane node** (workers are tainted by role, and `deploy-app.sh` installs Harbor's CA only there); `deployment.yml` and the `helm-hello-kube` chart carry the matching `nodeSelector`/toleration.
 - **The Harbor chart resolves `existingSecret` with `lookup` at render time**, so the Secrets must exist before `helm install`; `helm template` without a cluster shows empty passwords. Use `DRY_RUN=1 make harbor-ha`.
+- **Rolling updates of core/registry/portal need the `preStop` sleep.** The Harbor chart has no `preStop` hook, so a terminating registry pod was still receiving requests from core for a few seconds and core answered `502` (and requests stalled for ~5 s). `hack/helm-postrender.py`, applied by `make harbor-ha` as a Helm post-renderer, adds `preStop: sleep 15`; with it, continuous pulls during rolling updates showed 0 errors (H4.3).
 - **Everything shares one host disk.** Bursts of I/O (image builds with `dd`, pushes of gigabytes) can stall etcd and the apiserver: `kube-controller-manager` and `kube-scheduler` then lose their leader-election lease and crash-loop for minutes (pods are not recreated meanwhile), Valkey logs `AOF fsync is taking too long`, and Sentinel may fail over. Lease timings (60/40/10 s) and Sentinel `down-after-milliseconds` (15000) are tuned for this; still, keep test data small and let the load settle. The `kind-cluster.yaml` leader-election patch has not been verified by a full rebuild yet.
 - **Delete test artifacts from Harbor by digest, not by tag.** Deleting an artifact removes all its tags; a test tag on the same digest as `python/hello:1.0` deletes the demo image (`make deploy-app` restores it).
 - **Image pulls can fail transiently** on a cold start (`ErrImagePull`/`ImagePullBackOff`, e.g. Docker Hub token fetch errors or a quay.io `NotFound`). Kubernetes retries and the pods recover on their own; do not re-create the cluster because of it.

@@ -53,5 +53,8 @@ fi
 
 helm repo add harbor https://helm.goharbor.io
 helm repo update harbor
+# The post-renderer adds a preStop sleep to core/registry/portal so rolling updates do not drop requests
+# (see hack/helm-postrender.py; needs python3 + PyYAML).
 helm upgrade -i harbor harbor/harbor --version 1.19.2 -f "$CURDIR/config/harbor-ha.yaml" \
+  --post-renderer "$CURDIR/helm-postrender.py" \
   ${DRY_RUN:+--dry-run=server}
