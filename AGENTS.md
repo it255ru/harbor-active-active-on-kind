@@ -15,7 +15,7 @@ Where to start: `backlog.md` (Russian, plan, decisions D1–D10/D4a, pins and re
 | `hack/install-harbor-ha.sh`, `hack/config/harbor-ha.yaml`, `hack/helm-postrender.py` | Harbor in HA: Secrets, pinned Helm chart, `preStop` post-renderer (`make harbor-ha`) |
 | `hack/install.sh` | `infra-lb`, then `harbor-ha` (`make install`) |
 | `hack/deploy-app.sh` | Build/push the demo image, trust Harbor's CA on the node, deploy the app (`make deploy-app`) |
-| `hack/tests/` | Failure-test scripts and analyzers: `h41-push-pull.sh`, `h42-kill-during-push.sh`, `h43-rolling-update.sh`, `h44-node-loss.sh`, `h45-app-rollout.sh`, `h46-proxy-cache.sh`, `h47-role-failure.sh` (+ `h4x_analyze.py`) |
+| `hack/tests/` | Failure-test scripts and analyzers: `h41-push-pull.sh`, `h42-kill-during-push.sh`, `h43-rolling-update.sh`, `h44-node-loss.sh`, `h45-app-rollout.sh`, `h46-proxy-cache.sh`, `h47-role-failure.sh`, `h62-sync-mode.sh` (+ `h4x_analyze.py`) |
 | `ansible/` | `verify.yml` + roles `verify_*` (V1..V12), `group_vars/all.yml` (numbers, addresses), `files/s3-access.sh`; run with `make verify` |
 | `hack/images.txt`, `hack/image-cache.sh` | Pinned third-party images with node roles; local cache (`~/.cache/harbor-ha`), `make images-save/load/check/status` |
 | `hack/add_host.sh` | Add the Harbor hostname to `/etc/hosts` |

@@ -136,6 +136,7 @@ The failure tests are scripts in `hack/tests/`. They run real load, kill real no
 | `h44-node-loss.sh [node]` | kills an `app` node under load, waits for eviction, brings it back | 4-8 min |
 | `h45-app-rollout.sh` | rolls the demo app to a freshly pushed tag; `DEGRADE=1` with one registry and one core killed | 1 min |
 | `h46-proxy-cache.sh` | proxy-cache project for Docker Hub, served from the cache with the upstream cut off | 4 min |
+| `h62-sync-mode.sh <off\|on\|strict>` | what Patroni `synchronous_mode` changes: deletes the replica pod, then the leader pod under a writer; restores the config | 4 min |
 | `h47-role-failure.sh <lb\|pg\|redis\|consul>` | kills the node of the role holder under load, checks lost acknowledged writes | 5 min each |
 
 ## Failure behaviour (measured)
