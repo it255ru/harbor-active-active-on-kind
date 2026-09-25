@@ -65,7 +65,7 @@ flowchart TB
     pg -- "cluster state" --> consul
 ```
 
-Поток запроса `docker push`: клиент → `172.20.0.100` (MetalLB) → ingress-nginx → core (проверка токена) → registry → блобы в MinIO; метаданные (проекты, артефакты, пользователи) — в PostgreSQL, кэш и очереди — в Redis. HAProxy направляет соединения к БД на текущий primary Patroni, соединения к Redis — на текущий master.
+Поток запроса `docker push`: клиент → `172.20.0.100` (MetalLB) → ingress-nginx → core (проверка токена) → registry → блобы в S3 (Garage); метаданные (проекты, артефакты, пользователи) — в PostgreSQL, кэш и очереди — в Redis. HAProxy направляет соединения к БД на текущий primary Patroni, соединения к Redis — на текущий master.
 
 Бэкапы, Prometheus и Nexus с исходной схемы в лабораторию не входят (решения D8, D10 в `backlog.md`).
 

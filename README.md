@@ -180,7 +180,7 @@ The windows come from settings: Kubernetes ~45-55 s to declare a node lost, Sent
 **Storage and environment**
 
 - S3 is Garage, one node, one drive, no replication. It replaced MinIO because MinIO's quay.io images became private and are not on Docker Hub. The Garage image has no shell: `hack/ha/s3-init.sh` runs the `garage` CLI through `kubectl exec`.
-- Every image is pinned by digest, which does not help if a registry withdraws the repository (that is how MinIO was lost). Check availability before deleting a working cluster.
+- Every image is pinned by digest, which does not help if a registry withdraws the repository (that is how MinIO was lost). Run `make images-save` (cache complete) and `make images-check` before deleting a working cluster.
 - The PostgreSQL+Patroni image is built locally (`make pg-image`, run by `make postgres`) and loaded with `kind load` into the `pg` nodes only; it disappears with the cluster.
 - Everything shares one host disk. Bursts of I/O (image builds, multi-gigabyte pushes) stall etcd and the apiserver: controller-manager and scheduler lose their leader-election lease (timings 60/40/10 s are set in `kind-cluster.yaml`), Valkey logs `AOF fsync is taking too long`, Sentinel may fail over (`down-after` 15 s). Keep test data small.
 - Consul has no ACL/TLS, Sentinel has no password, PostgreSQL replication is asynchronous: deliberate for the lab (backlog D8).

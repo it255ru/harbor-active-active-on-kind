@@ -2,7 +2,7 @@
 
 Repo: **harbor-active-active-on-kind**. Harbor in active-active (HA) mode on KinD: two replicas each of core/portal/registry/jobservice behind ingress, sharing external PostgreSQL (Patroni + Consul), Redis (Valkey + Sentinel) and S3 (Garage), on a 14-node cluster. It started on 2026-09-24 as a copy of `harbor-on-kind` @ `b65df71` (https://github.com/it255ru/harbor-on-kind, full history kept, not a GitHub fork).
 
-**Status:** Phases 0–4 are done and were re-verified on a stand rebuilt from scratch (milestone 1 accepted by the user on 2026-09-24; failure tests H4.1–H4.7 and the from-scratch acceptance H5.3 passed). H5.4 is done (Ansible port of the runbook, `make verify`). H5.5 is done (image cache, `make images-save` / `images-load`). Nothing else is open in `backlog.md`. `backlog.md` (Russian) is the source of truth; see also `AGENTS.md` (layout, flow) and `README.md` (human runbook).
+**Status:** Phases 0–4 are done and were re-verified on a stand rebuilt from scratch (milestone 1 accepted by the user on 2026-09-24; failure tests H4.1–H4.7 and the from-scratch acceptance H5.3 passed). H5.4 is done (Ansible port of the runbook, `make verify`). H5.5 is done (image cache, `make images-save` / `images-load`). Phase 6 is done too (H6.1 offline cluster branch from the cache, H6.2 Patroni `synchronous_mode` measured, left off by default). Nothing is open in `backlog.md`. `backlog.md` (Russian) is the source of truth; see also `AGENTS.md` (layout, flow) and `README.md` (human runbook).
 
 ## Rules
 
@@ -55,7 +55,7 @@ make cluster-ctx     # kubectl use-context kind-harbor
 make cluster-delete
 ```
 
-Variables: `CLUSTER`, `KIND_IMAGE`, `KIND_VERSION`, `LB_IP`, `HARBOR_HOST`, `LOCALBIN`, `PG_IMAGE`. Tests: `hack/tests/h41…h47` (see `README.md`). Checks: `docs/verification-runbook.md` (V1–V12, P4.1–P4.7); run the relevant ones after any change to `hack/ha/` or `hack/config/` and keep the runbook in sync.
+Variables: `CLUSTER`, `KIND_IMAGE`, `KIND_VERSION`, `LB_IP`, `HARBOR_HOST`, `LOCALBIN`, `PG_IMAGE`. Tests: `hack/tests/h41…h47`, `h62-sync-mode.sh` (see `README.md`). Checks: `docs/verification-runbook.md` (V1–V12, P4.1–P4.7); run the relevant ones after any change to `hack/ha/` or `hack/config/` and keep the runbook in sync.
 
 ## Gotchas
 
