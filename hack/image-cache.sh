@@ -85,17 +85,24 @@ cmd_load() {
 }
 
 cmd_check() {
-  # rc 124 = timeout: the registry did not answer, which says nothing about the artifact (UNKNOWN, still non-zero)
-  local ref roles rc=0 r
-  probe() { timeout 90 "$@" >/dev/null 2>&1; r=$?; [ $r = 124 ] && timeout 90 "$@" >/dev/null 2>&1; r=$?; }
+  # ok = the registry answered; MISSING = the registry said "not found / unauthorized" (the MinIO case);
+  # UNKNOWN = anything else (timeout, CDN or network error): says nothing about the artifact. Both non-ok are non-zero.
+  local ref roles rc=0 r err
+  probe() {
+    err=$(timeout 90 "$@" 2>&1 >/dev/null); r=$?
+    if [ $r != 0 ]; then err=$(timeout 90 "$@" 2>&1 >/dev/null); r=$?; fi   # one retry
+    if [ $r = 0 ]; then verdict=ok
+    elif echo "$err" | grep -qiE "manifest unknown|no such manifest|not found|denied|unauthorized|requires authentication|401|404"; then verdict=MISSING
+    else verdict=UNKNOWN; fi
+  }
   while read -r ref roles; do
     probe docker manifest inspect "$ref"
-    case $r in 0) echo "ok       $ref";; 124) echo "UNKNOWN  $ref (registry timeout)" >&2; rc=1;; *) echo "MISSING  $ref" >&2; rc=1;; esac
+    if [ $verdict = ok ]; then echo "ok       $ref"; else echo "$verdict  $ref ($(echo "$err" | head -1 | cut -c1-80))" >&2; rc=1; fi
   done < <(entries)
   for c in "${CHARTS[@]}"; do
     set -- $c
     probe helm show chart "$3" --repo "$2" --version "$4"
-    case $r in 0) echo "ok       chart $3 $4";; 124) echo "UNKNOWN  chart $3 $4 (timeout)" >&2; rc=1;; *) echo "MISSING  chart $3 $4" >&2; rc=1;; esac
+    if [ $verdict = ok ]; then echo "ok       chart $3 $4"; else echo "$verdict  chart $3 $4 ($(echo "$err" | head -1 | cut -c1-80))" >&2; rc=1; fi
   done
   return $rc
 }
